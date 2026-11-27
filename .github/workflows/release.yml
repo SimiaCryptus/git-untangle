@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build release binaries
+        run: cargo build --release --locked --target ${{ matrix.target }} --bins
+      - name: Package binaries, completions, and manpages
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="git-untangle-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "$STAGE/completions" "$STAGE/man"
+          EXT=""
+          if [[ "${{ matrix.os }}" == windows-* ]]; then EXT=".exe"; fi
+          BIN_DIR="target/${{ matrix.target }}/release"
+          cp "$BIN_DIR/git-untangle$EXT" "$STAGE/"
+          cp "$BIN_DIR/git-chat$EXT" "$STAGE/"
+          "$BIN_DIR/git-untangle$EXT" --generate-completions bash > "$STAGE/completions/git-untangle.bash"
+          "$BIN_DIR/git-untangle$EXT" --generate-completions zsh > "$STAGE/completions/_git-untangle"
+          "$BIN_DIR/git-untangle$EXT" --generate-completions fish > "$STAGE/completions/git-untangle.fish"
+          "$BIN_DIR/git-untangle$EXT" --generate-completions powershell > "$STAGE/completions/git-untangle.ps1"
+          "$BIN_DIR/git-untangle$EXT" --generate-manpage > "$STAGE/man/git-untangle.1"
+          "$BIN_DIR/git-chat$EXT" --generate-manpage > "$STAGE/man/git-chat.1"
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            7z a "${STAGE}.zip" "$STAGE"
+          else
+            tar -czf "${STAGE}.tar.gz" "$STAGE"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: git-untangle-*.*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate SHA256SUMS
+        run: cd dist && sha256sum * > SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
