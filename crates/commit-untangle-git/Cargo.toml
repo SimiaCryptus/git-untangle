@@ -1,0 +1,16 @@
+[package]
+name = "commit-untangle-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+commit-untangle-core.workspace = true
+hex.workspace = true
+indexmap.workspace = true
+libc.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
