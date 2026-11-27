@@ -53,9 +53,16 @@ git untangle HEAD --no-llm --verify "cargo check --quiet"
 export ANTHROPIC_API_KEY="sk-ant-..."
 git untangle HEAD --model anthropic::claude-sonnet-4-5 --verify "cargo check --quiet"
 
+# Interactive chat about revision history backed by an MCP tool server
+git chat --model anthropic::claude-sonnet-4-5 log
+git chat --model anthropic::claude-sonnet-4-5 --prompt "When was auth added?" log
+
+# Autogenerate a commit message from staged changes and commit
+git chat --model anthropic::claude-sonnet-4-5 commit
+git chat --model anthropic::claude-sonnet-4-5 commit --dry-run
+
 # Interactive chat about any Git command (direct output captured up to 20 KiB by default)
 git chat --model anthropic::claude-sonnet-4-5 diff main..HEAD
-git chat --max-bytes 40960 --prompt "Summarize the riskiest change" log -p -n 5
 
 # Configure default chat byte limit in Git config (or GIT_CHAT_MAX_BYTES)
 git config untangle.chatMaxBytes 20480

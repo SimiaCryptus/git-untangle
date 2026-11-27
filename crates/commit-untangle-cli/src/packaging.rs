@@ -206,7 +206,10 @@ pub fn render_manpage_chat() -> String {
          \\fBgit-chat\\fR runs standard Git commands, echoes their direct output, and opens an interactive chat session \
          informed by that output (self-limited to 20480 bytes by default; configurable via \\fB\\-\\-max\\-bytes\\fR, \
          \\fBgit config untangle.chatMaxBytes\\fR, or \\fBGIT_CHAT_MAX_BYTES\\fR). \
-         It also dispatches semantic subcommands such as \\fBgit chat untangle\\fR.\n\
+         \\fBgit chat log\\fR opens an interactive session connected to an MCP revision-history tool server for navigating, \
+         searching, diffing, blaming, and inspecting commits. \
+         \\fBgit chat commit\\fR autogenerates a commit message from staged changes and creates the commit. \
+         It also dispatches semantic subcommands such as \\fBgit chat untangle\\fR and exposes \\fB\\-\\-mcp\\-log\\-server\\fR.\n\
          .SH OPTIONS\n\
          .TP\n\\fB\\-m\\fR, \\fB\\-\\-model\\fR \\fIPROVIDER::ID\\fR\nLLM provider and model.\n\
          .TP\n\\fB\\-\\-max\\-bytes\\fR \\fIN\\fR\nMaximum bytes of captured Git output passed into chat context (default: 20480).\n\

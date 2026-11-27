@@ -90,7 +90,9 @@ pub enum SemanticTask {
     InferDependencies,
     DiagnoseBuildFailure,
     WriteCommitMessages,
+    AutoCommitMessage,
     InteractiveChat,
+    ToolChat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -127,9 +129,83 @@ impl ChatRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
+pub enum ToolChatMessage {
+    System {
+        content: String,
+    },
+    User {
+        content: String,
+    },
+    Assistant {
+        #[serde(default)]
+        content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tool_calls: Vec<ToolCall>,
+    },
+    ToolResult {
+        tool_call_id: String,
+        tool_name: String,
+        content: String,
+        #[serde(default)]
+        is_error: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolChatRequest {
+    pub messages: Vec<ToolChatMessage>,
+    pub tools: Vec<ToolDefinition>,
+    pub temperature: f32,
+}
+
+impl ToolChatRequest {
+    pub fn cache_key(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"tool_chat");
+        if let Ok(tools_json) = serde_json::to_string(&self.tools) {
+            hasher.update([0u8]);
+            hasher.update(tools_json.as_bytes());
+        }
+        for m in &self.messages {
+            hasher.update([0u8]);
+            if let Ok(msg_json) = serde_json::to_string(m) {
+                hasher.update(msg_json.as_bytes());
+            }
+        }
+        hex::encode(hasher.finalize())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolChatResponse {
+    #[serde(default)]
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+}
+
 #[async_trait]
 pub trait ChatModel: Send + Sync {
     async fn chat(&self, request: ChatRequest) -> Result<String, LlmError>;
+
+    async fn chat_with_tools(&self, request: ToolChatRequest)
+        -> Result<ToolChatResponse, LlmError>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,6 +329,32 @@ impl ChatModel for ReplayModel {
                 )
             })
     }
+
+    async fn chat_with_tools(
+        &self,
+        request: ToolChatRequest,
+    ) -> Result<ToolChatResponse, LlmError> {
+        let key = request.cache_key();
+        let val = self.entries.get(&key).ok_or(LlmError::CassetteMiss {
+            task: SemanticTask::ToolChat,
+            key,
+        })?;
+        if let Ok(resp) = serde_json::from_value::<ToolChatResponse>(val.clone()) {
+            return Ok(resp);
+        }
+        if let Some(reply) = val
+            .as_str()
+            .or_else(|| val.get("reply").and_then(|v| v.as_str()))
+        {
+            return Ok(ToolChatResponse {
+                content: reply.to_owned(),
+                tool_calls: Vec::new(),
+            });
+        }
+        Err(LlmError::InvalidOutput(
+            "tool chat cassette entry must be ToolChatResponse, string, or {reply}".to_owned(),
+        ))
+    }
 }
 
 /// Decorator recording requests and responses to a JSONL cassette file.
@@ -322,6 +424,22 @@ impl<M: ChatModel> ChatModel for RecordingModel<M> {
         };
         self.append_entry(&entry)?;
         Ok(reply)
+    }
+
+    async fn chat_with_tools(
+        &self,
+        request: ToolChatRequest,
+    ) -> Result<ToolChatResponse, LlmError> {
+        let key = request.cache_key();
+        let response = self.inner.chat_with_tools(request).await?;
+        let entry = CassetteEntry {
+            key,
+            task: SemanticTask::ToolChat,
+            prompt_version: prompts::PROMPT_VERSION.to_owned(),
+            response: serde_json::to_value(&response)?,
+        };
+        self.append_entry(&entry)?;
+        Ok(response)
     }
 }
 

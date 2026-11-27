@@ -2,9 +2,11 @@ use commit_untangle_core::graph::ChangeGraph;
 use commit_untangle_core::model::{ChangeItem, ItemKind, Operation};
 use indexmap::IndexMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::schemas::{
-    build_diagnosis_schema, cluster_refinement_schema, commit_messages_schema,
-    dependency_proposal_schema,
+    auto_commit_message_schema, build_diagnosis_schema, cluster_refinement_schema,
+    commit_messages_schema, dependency_proposal_schema,
 };
 use crate::{SemanticTask, StructuredRequest};
 
@@ -590,6 +592,100 @@ Return ONLY valid JSON conforming to the schema.";
         system_prompt,
         user_prompt: user,
         json_schema: commit_messages_schema(),
+        temperature: 0.2,
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoCommitMessageDraft {
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub body: String,
+}
+
+impl AutoCommitMessageDraft {
+    /// Formats the drafted subject and optional body into a clean Git commit message.
+    pub fn format_commit_message(&self) -> String {
+        let subject = self
+            .subject
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches('.');
+        let body = self.body.trim();
+        if body.is_empty() {
+            format!("{subject}\n")
+        } else {
+            format!("{subject}\n\n{body}\n")
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AutoCommitContext<'a> {
+    pub branch: &'a str,
+    pub recent_subjects: &'a [String],
+    pub diff_stat: &'a str,
+    pub diff_text: &'a str,
+    pub diff_truncated: bool,
+    pub total_diff_bytes: usize,
+    pub amend_previous_message: Option<&'a str>,
+    pub user_hint: Option<&'a str>,
+}
+
+pub fn build_auto_commit_message_request(ctx: &AutoCommitContext<'_>) -> StructuredRequest {
+    let system_prompt = "\
+You are an expert software engineer writing a Git commit message for the staged changes.
+Write a clear, accurate, concise commit message:
+- `subject`: imperative mood, <= 72 characters, no trailing period. Match the repository's existing commit style (e.g. Conventional Commits like `feat:`, `fix:`, `refactor:`, `chore:`, `docs:`, `test:` if recent commits use it).
+- `body`: concise explanation of what changed and why (blank string `\"\"` if the change is trivial and self-explanatory from the subject alone). Wrap body lines around 72 characters.
+Return ONLY valid JSON matching the schema `{ \"subject\": \"...\", \"body\": \"...\" }`.".to_owned();
+
+    let mut user = String::new();
+    if !ctx.branch.trim().is_empty() {
+        user.push_str(&format!("## Branch\n{}\n\n", ctx.branch.trim()));
+    }
+    if !ctx.recent_subjects.is_empty() {
+        user.push_str("## Recent Commit Subjects (for style reference)\n");
+        for s in ctx.recent_subjects.iter().take(10) {
+            user.push_str(&format!("- {s}\n"));
+        }
+        user.push('\n');
+    }
+    if let Some(prev) = ctx.amend_previous_message {
+        if !prev.trim().is_empty() {
+            user.push_str("## Previous Commit Message Being Amended\n");
+            user.push_str(prev.trim());
+            user.push_str("\n\n");
+        }
+    }
+    if let Some(hint) = ctx.user_hint {
+        if !hint.trim().is_empty() {
+            user.push_str("## User Guidance\n");
+            user.push_str(hint.trim());
+            user.push_str("\n\n");
+        }
+    }
+    if !ctx.diff_stat.trim().is_empty() {
+        user.push_str("## Diff Stat\n```\n");
+        user.push_str(ctx.diff_stat.trim());
+        user.push_str("\n```\n\n");
+    }
+    user.push_str(&format!(
+        "## Staged Diff ({} bytes{})\n```diff\n{}\n```\n\nRespond with JSON containing `subject` and `body`.",
+        ctx.total_diff_bytes,
+        if ctx.diff_truncated { ", truncated" } else { "" },
+        ctx.diff_text
+    ));
+
+    StructuredRequest {
+        task: SemanticTask::AutoCommitMessage,
+        prompt_version: PROMPT_VERSION.to_owned(),
+        system_prompt,
+        user_prompt: user,
+        json_schema: auto_commit_message_schema(),
         temperature: 0.2,
     }
 }

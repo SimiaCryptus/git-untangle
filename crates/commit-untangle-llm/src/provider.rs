@@ -8,6 +8,7 @@ use tracing::debug;
 
 use crate::{
     ChatMessage, ChatModel, ChatRequest, ChatRole, LlmError, SemanticModel, StructuredRequest,
+    ToolCall, ToolChatMessage, ToolChatRequest, ToolChatResponse, ToolDefinition,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -805,6 +806,601 @@ impl ProviderModel {
                 LlmError::InvalidOutput("Ollama chat response missing message.content".to_owned())
             })
     }
+
+    async fn chat_with_tools_anthropic(
+        &self,
+        messages: &[ToolChatMessage],
+        tools: &[ToolDefinition],
+        temperature: f32,
+    ) -> Result<ToolChatResponse, LlmError> {
+        let url = format!("{}/v1/messages", self.base_url);
+        let key = self.api_key.as_deref().unwrap_or("");
+        let mut system_parts = Vec::new();
+        let mut turns: Vec<Value> = Vec::new();
+
+        let mut i = 0;
+        while i < messages.len() {
+            match &messages[i] {
+                ToolChatMessage::System { content } => {
+                    system_parts.push(content.as_str());
+                    i += 1;
+                }
+                ToolChatMessage::User { content } => {
+                    turns.push(json!({ "role": "user", "content": content }));
+                    i += 1;
+                }
+                ToolChatMessage::Assistant {
+                    content,
+                    tool_calls,
+                } => {
+                    let mut blocks = Vec::new();
+                    if !content.is_empty() {
+                        blocks.push(json!({ "type": "text", "text": content }));
+                    }
+                    for call in tool_calls {
+                        blocks.push(json!({
+                            "type": "tool_use",
+                            "id": call.id,
+                            "name": call.name,
+                            "input": call.arguments,
+                        }));
+                    }
+                    if blocks.is_empty() {
+                        blocks.push(json!({ "type": "text", "text": "" }));
+                    }
+                    turns.push(json!({ "role": "assistant", "content": blocks }));
+                    i += 1;
+                }
+                ToolChatMessage::ToolResult { .. } => {
+                    let mut blocks = Vec::new();
+                    while let Some(ToolChatMessage::ToolResult {
+                        tool_call_id,
+                        content,
+                        is_error,
+                        ..
+                    }) = messages.get(i)
+                    {
+                        let mut block = json!({
+                            "type": "tool_result",
+                            "tool_use_id": tool_call_id,
+                            "content": content,
+                        });
+                        if *is_error {
+                            block["is_error"] = json!(true);
+                        }
+                        blocks.push(block);
+                        i += 1;
+                    }
+                    turns.push(json!({ "role": "user", "content": blocks }));
+                }
+            }
+        }
+
+        let mut body = json!({
+            "model": self.spec.model,
+            "max_tokens": 8192,
+            "system": system_parts.join("\n\n"),
+            "messages": turns,
+        });
+        if !tools.is_empty() {
+            let tool_defs: Vec<Value> = tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.input_schema,
+                    })
+                })
+                .collect();
+            body["tools"] = json!(tool_defs);
+        }
+        if !self.omit_temperature.load(Ordering::Relaxed) {
+            body["temperature"] = json!(temperature);
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("x-api-key", key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| LlmError::Http(e.to_string()))?;
+
+        let status = resp.status();
+        let val: Value = resp
+            .json()
+            .await
+            .map_err(|e| LlmError::Http(format!("HTTP {status}: {e}")))?;
+        if !status.is_success() {
+            return Err(LlmError::ProviderResponse {
+                status: status.as_u16(),
+                body: val.to_string(),
+            });
+        }
+
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        if let Some(arr) = val.get("content").and_then(Value::as_array) {
+            for block in arr {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(t) = block.get("text").and_then(Value::as_str) {
+                            content.push_str(t);
+                        }
+                    }
+                    Some("tool_use") => {
+                        let id = block
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool_call")
+                            .to_owned();
+                        let name = block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        let arguments = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                        if !name.is_empty() {
+                            tool_calls.push(ToolCall {
+                                id,
+                                name,
+                                arguments,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if content.is_empty() && tool_calls.is_empty() {
+            return Err(LlmError::InvalidOutput(
+                "Anthropic tool-chat response contained neither text nor tool_use blocks"
+                    .to_owned(),
+            ));
+        }
+        Ok(ToolChatResponse {
+            content,
+            tool_calls,
+        })
+    }
+
+    async fn chat_with_tools_openai(
+        &self,
+        messages: &[ToolChatMessage],
+        tools: &[ToolDefinition],
+        temperature: f32,
+    ) -> Result<ToolChatResponse, LlmError> {
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let key = self.api_key.as_deref().unwrap_or("");
+        let turns: Vec<Value> = messages
+            .iter()
+            .map(|m| match m {
+                ToolChatMessage::System { content } => {
+                    json!({ "role": "system", "content": content })
+                }
+                ToolChatMessage::User { content } => {
+                    json!({ "role": "user", "content": content })
+                }
+                ToolChatMessage::Assistant {
+                    content,
+                    tool_calls,
+                } => {
+                    let mut msg = json!({
+                        "role": "assistant",
+                        "content": if content.is_empty() && !tool_calls.is_empty() {
+                            Value::Null
+                        } else {
+                            Value::String(content.clone())
+                        },
+                    });
+                    if !tool_calls.is_empty() {
+                        let tc: Vec<Value> = tool_calls
+                            .iter()
+                            .map(|c| {
+                                json!({
+                                    "id": c.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": c.name,
+                                        "arguments": c.arguments.to_string(),
+                                    }
+                                })
+                            })
+                            .collect();
+                        msg["tool_calls"] = json!(tc);
+                    }
+                    msg
+                }
+                ToolChatMessage::ToolResult {
+                    tool_call_id,
+                    content,
+                    ..
+                } => json!({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": content,
+                }),
+            })
+            .collect();
+
+        let mut body = json!({
+            "model": self.spec.model,
+            "messages": turns,
+        });
+        if !tools.is_empty() {
+            let tool_defs: Vec<Value> = tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.input_schema,
+                        }
+                    })
+                })
+                .collect();
+            body["tools"] = json!(tool_defs);
+        }
+        if !self.omit_temperature.load(Ordering::Relaxed) {
+            body["temperature"] = json!(temperature);
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| LlmError::Http(e.to_string()))?;
+
+        let status = resp.status();
+        let val: Value = resp
+            .json()
+            .await
+            .map_err(|e| LlmError::Http(format!("HTTP {status}: {e}")))?;
+        if !status.is_success() {
+            return Err(LlmError::ProviderResponse {
+                status: status.as_u16(),
+                body: val.to_string(),
+            });
+        }
+
+        let msg = val.pointer("/choices/0/message").ok_or_else(|| {
+            LlmError::InvalidOutput("OpenAI tool-chat response missing choices[0].message".to_owned())
+        })?;
+        let content = msg
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let mut tool_calls = Vec::new();
+        if let Some(arr) = msg.get("tool_calls").and_then(Value::as_array) {
+            for (idx, tc) in arr.iter().enumerate() {
+                let id = tc
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("openai_call_{idx}"));
+                let name = tc
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let args_val = tc.pointer("/function/arguments");
+                let arguments = match args_val {
+                    Some(Value::String(s)) if !s.trim().is_empty() => {
+                        serde_json::from_str(s).unwrap_or_else(|_| json!({ "raw": s }))
+                    }
+                    Some(Value::Object(m)) => Value::Object(m.clone()),
+                    _ => json!({}),
+                };
+                if !name.is_empty() {
+                    tool_calls.push(ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    });
+                }
+            }
+        }
+        Ok(ToolChatResponse {
+            content,
+            tool_calls,
+        })
+    }
+
+    async fn chat_with_tools_gemini(
+        &self,
+        messages: &[ToolChatMessage],
+        tools: &[ToolDefinition],
+        temperature: f32,
+    ) -> Result<ToolChatResponse, LlmError> {
+        let url = format!(
+            "{}/v1beta/models/{}:generateContent",
+            self.base_url, self.spec.model
+        );
+        let key = self.api_key.as_deref().unwrap_or("");
+
+        let mut system_parts = Vec::new();
+        let mut contents: Vec<Value> = Vec::new();
+        let mut i = 0;
+        while i < messages.len() {
+            match &messages[i] {
+                ToolChatMessage::System { content } => {
+                    system_parts.push(content.as_str());
+                    i += 1;
+                }
+                ToolChatMessage::User { content } => {
+                    contents.push(json!({
+                        "role": "user",
+                        "parts": [{ "text": content }]
+                    }));
+                    i += 1;
+                }
+                ToolChatMessage::Assistant {
+                    content,
+                    tool_calls,
+                } => {
+                    let mut parts = Vec::new();
+                    if !content.is_empty() {
+                        parts.push(json!({ "text": content }));
+                    }
+                    for call in tool_calls {
+                        parts.push(json!({
+                            "functionCall": {
+                                "name": call.name,
+                                "args": call.arguments,
+                            }
+                        }));
+                    }
+                    if parts.is_empty() {
+                        parts.push(json!({ "text": "" }));
+                    }
+                    contents.push(json!({ "role": "model", "parts": parts }));
+                    i += 1;
+                }
+                ToolChatMessage::ToolResult { .. } => {
+                    let mut parts = Vec::new();
+                    while let Some(ToolChatMessage::ToolResult {
+                        tool_name,
+                        content,
+                        is_error,
+                        ..
+                    }) = messages.get(i)
+                    {
+                        parts.push(json!({
+                            "functionResponse": {
+                                "name": tool_name,
+                                "response": {
+                                    "result": content,
+                                    "isError": is_error,
+                                }
+                            }
+                        }));
+                        i += 1;
+                    }
+                    contents.push(json!({ "role": "user", "parts": parts }));
+                }
+            }
+        }
+
+        let mut body = json!({
+            "systemInstruction": {
+                "parts": [{ "text": system_parts.join("\n\n") }]
+            },
+            "contents": contents,
+            "generationConfig": {
+                "temperature": temperature
+            }
+        });
+        if !tools.is_empty() {
+            let decls: Vec<Value> = tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.input_schema,
+                    })
+                })
+                .collect();
+            body["tools"] = json!([{ "functionDeclarations": decls }]);
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("x-goog-api-key", key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| LlmError::Http(e.to_string()))?;
+
+        let status = resp.status();
+        let val: Value = resp
+            .json()
+            .await
+            .map_err(|e| LlmError::Http(format!("HTTP {status}: {e}")))?;
+        if !status.is_success() {
+            return Err(LlmError::ProviderResponse {
+                status: status.as_u16(),
+                body: val.to_string(),
+            });
+        }
+
+        let parts = val
+            .pointer("/candidates/0/content/parts")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                LlmError::InvalidOutput(
+                    "Gemini tool-chat response missing candidates[0].content.parts".to_owned(),
+                )
+            })?;
+
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        for (idx, part) in parts.iter().enumerate() {
+            if let Some(t) = part.get("text").and_then(Value::as_str) {
+                content.push_str(t);
+            }
+            if let Some(fc) = part.get("functionCall") {
+                let name = fc
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let arguments = fc.get("args").cloned().unwrap_or_else(|| json!({}));
+                if !name.is_empty() {
+                    tool_calls.push(ToolCall {
+                        id: format!("gemini_call_{idx}"),
+                        name,
+                        arguments,
+                    });
+                }
+            }
+        }
+        Ok(ToolChatResponse {
+            content,
+            tool_calls,
+        })
+    }
+
+    async fn chat_with_tools_ollama(
+        &self,
+        messages: &[ToolChatMessage],
+        tools: &[ToolDefinition],
+        temperature: f32,
+    ) -> Result<ToolChatResponse, LlmError> {
+        let url = format!("{}/api/chat", self.base_url);
+        let turns: Vec<Value> = messages
+            .iter()
+            .map(|m| match m {
+                ToolChatMessage::System { content } => {
+                    json!({ "role": "system", "content": content })
+                }
+                ToolChatMessage::User { content } => {
+                    json!({ "role": "user", "content": content })
+                }
+                ToolChatMessage::Assistant {
+                    content,
+                    tool_calls,
+                } => {
+                    let mut msg = json!({ "role": "assistant", "content": content });
+                    if !tool_calls.is_empty() {
+                        let tc: Vec<Value> = tool_calls
+                            .iter()
+                            .map(|c| {
+                                json!({
+                                    "function": {
+                                        "name": c.name,
+                                        "arguments": c.arguments,
+                                    }
+                                })
+                            })
+                            .collect();
+                        msg["tool_calls"] = json!(tc);
+                    }
+                    msg
+                }
+                ToolChatMessage::ToolResult {
+                    tool_name,
+                    content,
+                    ..
+                } => json!({
+                    "role": "tool",
+                    "tool_name": tool_name,
+                    "content": content,
+                }),
+            })
+            .collect();
+
+        let mut body = json!({
+            "model": self.spec.model,
+            "stream": false,
+            "options": { "temperature": temperature },
+            "messages": turns,
+        });
+        if !tools.is_empty() {
+            let tool_defs: Vec<Value> = tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.input_schema,
+                        }
+                    })
+                })
+                .collect();
+            body["tools"] = json!(tool_defs);
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| LlmError::Http(e.to_string()))?;
+
+        let status = resp.status();
+        let val: Value = resp
+            .json()
+            .await
+            .map_err(|e| LlmError::Http(format!("HTTP {status}: {e}")))?;
+        if !status.is_success() {
+            return Err(LlmError::ProviderResponse {
+                status: status.as_u16(),
+                body: val.to_string(),
+            });
+        }
+
+        let msg = val.get("message").ok_or_else(|| {
+            LlmError::InvalidOutput("Ollama tool-chat response missing message".to_owned())
+        })?;
+        let content = msg
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let mut tool_calls = Vec::new();
+        if let Some(arr) = msg.get("tool_calls").and_then(Value::as_array) {
+            for (idx, tc) in arr.iter().enumerate() {
+                let name = tc
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let args_val = tc.pointer("/function/arguments");
+                let arguments = match args_val {
+                    Some(Value::String(s)) if !s.trim().is_empty() => {
+                        serde_json::from_str(s).unwrap_or_else(|_| json!({ "raw": s }))
+                    }
+                    Some(Value::Object(m)) => Value::Object(m.clone()),
+                    _ => json!({}),
+                };
+                if !name.is_empty() {
+                    tool_calls.push(ToolCall {
+                        id: format!("ollama_call_{idx}"),
+                        name,
+                        arguments,
+                    });
+                }
+            }
+        }
+        Ok(ToolChatResponse {
+            content,
+            tool_calls,
+        })
+    }
 }
 
 #[async_trait]
@@ -834,6 +1430,58 @@ impl ChatModel for ProviderModel {
                     && is_temperature_unsupported_error(status, body)
                 {
                     debug!("chat model rejected `temperature`; retrying without temperature");
+                    self.omit_temperature.store(true, Ordering::Relaxed);
+                    continue;
+                }
+            }
+            return res;
+        }
+    }
+
+    async fn chat_with_tools(
+        &self,
+        request: ToolChatRequest,
+    ) -> Result<ToolChatResponse, LlmError> {
+        loop {
+            let res = match self.spec.provider {
+                ProviderKind::Anthropic => {
+                    self.chat_with_tools_anthropic(
+                        &request.messages,
+                        &request.tools,
+                        request.temperature,
+                    )
+                    .await
+                }
+                ProviderKind::Gemini => {
+                    self.chat_with_tools_gemini(
+                        &request.messages,
+                        &request.tools,
+                        request.temperature,
+                    )
+                    .await
+                }
+                ProviderKind::OpenAi | ProviderKind::OpenRouter => {
+                    self.chat_with_tools_openai(
+                        &request.messages,
+                        &request.tools,
+                        request.temperature,
+                    )
+                    .await
+                }
+                ProviderKind::Ollama => {
+                    self.chat_with_tools_ollama(
+                        &request.messages,
+                        &request.tools,
+                        request.temperature,
+                    )
+                    .await
+                }
+            };
+            if let Err(LlmError::ProviderResponse { status, ref body }) = res {
+                if !self.omit_temperature.load(Ordering::Relaxed)
+                    && is_temperature_unsupported_error(status, body)
+                {
+                    debug!("tool-chat model rejected `temperature`; retrying without temperature");
                     self.omit_temperature.store(true, Ordering::Relaxed);
                     continue;
                 }

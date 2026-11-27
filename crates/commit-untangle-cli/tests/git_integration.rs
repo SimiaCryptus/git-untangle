@@ -1062,3 +1062,473 @@ fn test_live_http_llm_sliced_commit_descriptions_and_404_model_failure() {
         "final merge commit should list LLM-authored operation titles:\n{head_msg}"
     );
 }
+
+#[test]
+fn test_mcp_log_stdio_server_revision_history_tools() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let repo = init_repo();
+    let r = repo.path();
+
+    fs::create_dir_all(r.join("src")).unwrap();
+    fs::write(
+        r.join("src/auth.rs"),
+        "pub fn verify_token(tok: &str) -> bool {\n    tok == \"secret\"\n}\n",
+    )
+    .unwrap();
+    git(r, &["add", "src/auth.rs"]);
+    git(r, &["commit", "-m", "feat(auth): add token verification"]);
+    let c1 = git(r, &["rev-parse", "HEAD"]);
+    git(r, &["tag", "v0.1.0"]);
+
+    git(r, &["mv", "src/auth.rs", "src/security.rs"]);
+    fs::write(
+        r.join("src/security.rs"),
+        "pub fn verify_token(tok: &str) -> bool {\n    tok.starts_with(\"bearer_\")\n}\n",
+    )
+    .unwrap();
+    git(r, &["add", "-A"]);
+    git(
+        r,
+        &["commit", "-m", "refactor(auth): rename auth module to security"],
+    );
+
+    let mut child = Command::new(bin_git_chat())
+        .args(["--mcp-log-server", "--repo", r.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn --mcp-log-server");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    let mut rpc = |req: serde_json::Value| -> serde_json::Value {
+        writeln!(stdin, "{req}").unwrap();
+        stdin.flush().unwrap();
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        serde_json::from_str(line.trim()).expect("valid JSON-RPC response")
+    };
+
+    // 1. initialize
+    let init = rpc(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2024-11-05", "capabilities": {} }
+    }));
+    assert_eq!(init["result"]["serverInfo"]["name"], "git-chat-log-mcp");
+
+    // 2. tools/list
+    let tools = rpc(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list",
+        "params": {}
+    }));
+    let tool_names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    for expected in [
+        "git_log",
+        "git_show_commit",
+        "git_search_commits",
+        "git_diff_revisions",
+        "git_file_history",
+        "git_blame",
+        "git_list_refs",
+        "git_show_file",
+        "git_commit_ancestry",
+    ] {
+        assert!(tool_names.contains(&expected), "missing tool {expected}");
+    }
+
+    // 3. git_search_commits (pickaxe_string)
+    let pickaxe = rpc(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "git_search_commits",
+            "arguments": { "query": "bearer_", "mode": "pickaxe_string" }
+        }
+    }));
+    assert_eq!(pickaxe["result"]["isError"], false);
+    assert!(pickaxe["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("rename auth module to security"));
+
+    // 4. git_file_history across rename
+    let hist = rpc(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": {
+            "name": "git_file_history",
+            "arguments": { "path": "src/security.rs" }
+        }
+    }));
+    let hist_text = hist["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(hist_text.contains("add token verification"));
+    assert!(hist_text.contains("rename auth module to security"));
+
+    // 5. git_show_file at older rev + git_list_refs + git_commit_ancestry
+    let old_file = rpc(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/call",
+        "params": {
+            "name": "git_show_file",
+            "arguments": { "rev": c1, "path": "src/auth.rs", "start_line": 1, "end_line": 2 }
+        }
+    }));
+    assert!(old_file["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("secret"));
+
+    let refs = rpc(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "tools/call",
+        "params": { "name": "git_list_refs", "arguments": { "kind": "all" } }
+    }));
+    assert!(refs["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("v0.1.0"));
+
+    // 6. Flag-injection protection
+    let bad = rpc(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": { "name": "git_show_commit", "arguments": { "rev": "--all" } }
+    }));
+    assert_eq!(bad["result"]["isError"], true);
+
+    drop(stdin);
+    let status = child.wait().unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn test_git_chat_log_interactive_mcp_tool_loop() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Stdio;
+    use std::thread;
+
+    let repo = init_repo();
+    let r = repo.path();
+
+    fs::write(r.join("app.rs"), "pub fn init() {}\n").unwrap();
+    git(r, &["add", "app.rs"]);
+    git(r, &["commit", "-m", "chore: initial app"]);
+
+    fs::write(
+        r.join("app.rs"),
+        "pub fn init() { enable_rate_limiter(); }\npub fn enable_rate_limiter() {}\n",
+    )
+    .unwrap();
+    git(r, &["add", "app.rs"]);
+    git(r, &["commit", "-m", "feat: add rate limiter hook"]);
+
+    // Mock Anthropic server:
+    // Turn 1: asks MCP server to call `git_search_commits` for `enable_rate_limiter`
+    // Turn 2: reads MCP tool_result and returns final answer citing the commit
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for round in 0..2 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .ok();
+            let mut req_bytes = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        req_bytes.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&req_bytes);
+                        if let Some(hdr_end) = text.find("\r\n\r\n") {
+                            let cl = text[..hdr_end]
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|v| v.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if req_bytes.len() >= hdr_end + 4 + cl {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let req_str = String::from_utf8_lossy(&req_bytes);
+            assert!(
+                req_str.contains("git_search_commits"),
+                "MCP tool definitions must be sent to LLM"
+            );
+            let envelope = if round == 0 {
+                serde_json::json!({
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "tu_search_1",
+                        "name": "git_search_commits",
+                        "input": { "query": "enable_rate_limiter", "mode": "pickaxe_string" }
+                    }],
+                    "stop_reason": "tool_use"
+                })
+            } else {
+                assert!(
+                    req_str.contains("feat: add rate limiter hook"),
+                    "second LLM round must receive MCP tool_result:\n{req_str}"
+                );
+                serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": "The rate limiter was introduced in `feat: add rate limiter hook`."
+                    }],
+                    "stop_reason": "end_turn"
+                })
+            }
+            .to_string();
+
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                envelope.len(),
+                envelope
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+
+    let mut child = Command::new(bin_git_chat())
+        .current_dir(r)
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", format!("http://{addr}"))
+        .args(["--model", "anthropic::claude-sonnet-4-5", "log"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, "/tools").unwrap();
+        writeln!(stdin, "/tool git_list_refs {{\"kind\":\"branches\"}}").unwrap();
+        writeln!(stdin, "Which commit introduced enable_rate_limiter?").unwrap();
+        writeln!(stdin, "/quit").unwrap();
+    }
+
+    let out = child.wait_with_output().unwrap();
+    let _ = server.join();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("MCP server `git-chat-log-mcp`"));
+    assert!(stderr.contains("[mcp] calling git_search_commits"));
+    assert!(stdout.contains("HEAD: main"));
+    assert!(stdout.contains("The rate limiter was introduced in `feat: add rate limiter hook`."));
+}
+
+#[test]
+fn test_git_chat_commit_autogenerates_message_and_handles_flags() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    let repo = init_repo();
+    let r = repo.path();
+
+    fs::write(r.join("lib.rs"), "pub fn add(a: i32, b: i32) -> i32 { a + b }\n").unwrap();
+    git(r, &["add", "lib.rs"]);
+    git(r, &["commit", "-m", "feat: add initial math library"]);
+
+    // 1. Nothing staged should fail with EXIT_PRECONDITION (3)
+    let empty_out = Command::new(bin_git_chat())
+        .current_dir(r)
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .args(["--model", "anthropic::claude-sonnet-4-5", "commit"])
+        .output()
+        .unwrap();
+    assert_eq!(empty_out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&empty_out.stderr).contains("nothing staged to commit"));
+
+    // 2. Stage a change and test `--dry-run`, actual `git chat commit`, and `--prompt` hint
+    fs::write(
+        r.join("lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\npub fn mul(a: i32, b: i32) -> i32 { a * b }\n",
+    )
+    .unwrap();
+    git(r, &["add", "lib.rs"]);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for _ in 0..3 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .ok();
+            let mut req_bytes = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        req_bytes.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&req_bytes);
+                        if let Some(hdr_end) = text.find("\r\n\r\n") {
+                            let cl = text[..hdr_end]
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|v| v.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if req_bytes.len() >= hdr_end + 4 + cl {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let req_str = String::from_utf8_lossy(&req_bytes);
+            let draft = if req_str.contains("mention overflow") {
+                serde_json::json!({
+                    "subject": "feat(math): add mul helper with overflow note",
+                    "body": "Adds `mul` alongside `add`.\nNote: callers should check for integer overflow."
+                })
+            } else if req_str.contains("sub(a: i32") {
+                serde_json::json!({
+                    "subject": "feat(math): add sub helper",
+                    "body": ""
+                })
+            } else {
+                serde_json::json!({
+                    "subject": "feat(math): add mul helper",
+                    "body": "Adds integer multiplication to lib.rs."
+                })
+            };
+            let envelope = serde_json::json!({
+                "content": [{ "type": "text", "text": draft.to_string() }],
+                "stop_reason": "end_turn"
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                envelope.len(),
+                envelope
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+
+    let head_before = git(r, &["rev-parse", "HEAD"]);
+
+    // 2a. --dry-run prints generated message without creating a commit
+    let dry_out = Command::new(bin_git_chat())
+        .current_dir(r)
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", format!("http://{addr}"))
+        .args([
+            "--model",
+            "anthropic::claude-sonnet-4-5",
+            "commit",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(dry_out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&dry_out.stdout).contains("feat(math): add mul helper"));
+    assert_eq!(git(r, &["rev-parse", "HEAD"]), head_before);
+
+    // 2b. Real `git chat --prompt "..." commit` commits with autogenerated message
+    let commit_out = Command::new(bin_git_chat())
+        .current_dir(r)
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", format!("http://{addr}"))
+        .args([
+            "--model",
+            "anthropic::claude-sonnet-4-5",
+            "--prompt",
+            "mention overflow",
+            "commit",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        commit_out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&commit_out.stderr)
+    );
+    let committed_msg = git(r, &["log", "-1", "--format=%B"]);
+    assert!(committed_msg.contains("feat(math): add mul helper with overflow note"));
+    assert!(committed_msg.contains("integer overflow"));
+
+    // 2c. `git chat commit -a` stages tracked modifications and commits
+    fs::write(
+        r.join("lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\npub fn mul(a: i32, b: i32) -> i32 { a * b }\npub fn sub(a: i32, b: i32) -> i32 { a - b }\n",
+    )
+    .unwrap();
+    let all_out = Command::new(bin_git_chat())
+        .current_dir(r)
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", format!("http://{addr}"))
+        .args(["--model", "anthropic::claude-sonnet-4-5", "commit", "-a"])
+        .output()
+        .unwrap();
+    let _ = server.join();
+    assert_eq!(
+        all_out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&all_out.stderr)
+    );
+    assert_eq!(
+        git(r, &["log", "-1", "--format=%s"]),
+        "feat(math): add sub helper"
+    );
+
+    // 3. Explicit `-m` bypasses LLM and commits directly
+    fs::write(r.join("notes.txt"), "manual\n").unwrap();
+    git(r, &["add", "notes.txt"]);
+    let manual_out = Command::new(bin_git_chat())
+        .current_dir(r)
+        .args(["commit", "-m", "docs: manual commit message"])
+        .output()
+        .unwrap();
+    assert_eq!(manual_out.status.code(), Some(0));
+    assert_eq!(
+        git(r, &["log", "-1", "--format=%s"]),
+        "docs: manual commit message"
+    );
+}

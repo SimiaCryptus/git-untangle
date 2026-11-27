@@ -1,5 +1,6 @@
 pub mod chat;
 pub mod config;
+pub mod mcp_log;
 pub mod packaging;
 pub mod report;
 pub mod viewer;
@@ -139,16 +140,24 @@ where
             let _ = write_stdout(
                 "git-chat — Interactive Git wrapper with semantic subcommands\n\n\
                  Usage:\n  \
+                 git chat [CHAT_OPTIONS] log [GIT_LOG_ARGS...]\n      \
+                 Opens an interactive chat session connected to an MCP revision-history tool server\n      \
+                 (navigate logs, search commits/pickaxe, inspect diffs, follow file history, blame, refs, ancestry).\n\n  \
+                 git chat [CHAT_OPTIONS] commit [GIT_COMMIT_ARGS...]\n      \
+                 Autogenerates a commit message from staged changes (or -a / --amend) and commits.\n      \
+                 Pass --dry-run to print the generated message without committing, or -e to edit it.\n\n  \
                  git chat [CHAT_OPTIONS] <git-command> [GIT_ARGS...]\n      \
                  Runs <git-command>, displays its direct output, and opens an interactive chat session\n      \
                  informed by that output (self-limited to 20480 bytes by default; configurable via --max-bytes\n      \
                  or `git config untangle.chatMaxBytes`).\n\n  \
                  git chat untangle [OPTIONS] [REV_OR_RANGE] [-- <PATHS>...]\n      \
-                 Decompose a commit or range into an ordered DAG of atomic operations\n\n\
+                 Decompose a commit or range into an ordered DAG of atomic operations\n\n  \
+                 git chat --mcp-log-server [--repo <DIR>]\n      \
+                 Run the Git revision-history MCP JSON-RPC 2.0 server over stdio\n\n\
                  Chat Options (place before <git-command>):\n  \
                  -m, --model <PROVIDER::ID>   LLM provider and model\n      \
                  --max-bytes <N>          Max bytes of Git output captured into chat context [default: 20480]\n  \
-                 -p, --prompt <QUESTION>      Ask an initial question about the command output\n      \
+                 -p, --prompt <QUESTION>      Ask an initial question (or provide commit message guidance)\n      \
                  --one-shot               Exit after answering --prompt\n      \
                  --no-chat                Run <git-command> directly without starting chat\n      \
                  --record-llm <PATH>      Record chat turns to a JSONL cassette\n      \
@@ -163,6 +172,42 @@ where
         "--generate-manpage" => {
             let _ = write_stdout(&render_manpage_chat());
             EXIT_OK
+        }
+        "--mcp-log-server" => {
+            let mut repo_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let mut i = 2usize;
+            while i < collected.len() {
+                let arg = collected[i].to_string_lossy();
+                if arg == "--repo" || arg == "-C" {
+                    if let Some(val) = collected.get(i + 1) {
+                        repo_dir = PathBuf::from(val);
+                        i += 2;
+                        continue;
+                    }
+                    eprintln!("error: missing value for {arg}");
+                    return EXIT_USAGE_OR_CONFIG;
+                } else if let Some(val) = arg.strip_prefix("--repo=") {
+                    repo_dir = PathBuf::from(val);
+                }
+                i += 1;
+            }
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("error: failed to initialize runtime: {e}");
+                    return EXIT_PRECONDITION;
+                }
+            };
+            match rt.block_on(mcp_log::run_mcp_stdio_server(repo_dir)) {
+                Ok(()) => EXIT_OK,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    EXIT_PRECONDITION
+                }
+            }
         }
         "untangle" => {
             let mut forwarded = Vec::with_capacity(collected.len());

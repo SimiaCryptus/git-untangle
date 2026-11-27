@@ -12,7 +12,7 @@ use commit_untangle_llm::prompts::{
 use commit_untangle_llm::{
     extract_json_value, generate_typed, ChatMessage, ChatModel, ChatRequest, ChatRole, LlmError,
     ModelSpec, ProviderKind, ProviderModel, RecordingModel, ReplayModel, SemanticModel,
-    SemanticTask, StructuredRequest,
+    SemanticTask, StructuredRequest, ToolCall, ToolChatMessage, ToolChatRequest, ToolDefinition,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -417,5 +417,149 @@ fn test_anthropic_deprecated_temperature_auto_omits_and_retries() {
         assert!(reqs[0].contains("\"temperature\""));
         assert!(!reqs[1].contains("\"temperature\""));
         assert!(!reqs[2].contains("\"temperature\""));
+    });
+}
+
+#[test]
+fn test_chat_with_tools_wire_conformance_across_providers_and_cassette() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let tools = vec![ToolDefinition {
+            name: "git_search_commits".to_owned(),
+            description: "Search commits".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+                "required": ["query"]
+            }),
+        }];
+
+        let base_req = ToolChatRequest {
+            messages: vec![
+                ToolChatMessage::System {
+                    content: "You are git-chat.".to_owned(),
+                },
+                ToolChatMessage::User {
+                    content: "Find auth commit".to_owned(),
+                },
+            ],
+            tools: tools.clone(),
+            temperature: 0.2,
+        };
+
+        // 1. Anthropic tool_use + tool_result roundtrip
+        let anth_r1 = json!({
+            "content": [
+                { "type": "text", "text": "Let me search." },
+                { "type": "tool_use", "id": "tu_1", "name": "git_search_commits", "input": { "query": "auth" } }
+            ]
+        })
+        .to_string();
+        let anth_r2 = json!({
+            "content": [{ "type": "text", "text": "Found commit abc123." }]
+        })
+        .to_string();
+        let (base, reqs) = spawn_mock_http(vec![anth_r1, anth_r2]).await;
+        let anth = ProviderModel::new(
+            ModelSpec::parse("anthropic::claude-sonnet-4-5").unwrap(),
+            Some("test-key".to_owned()),
+            base,
+        )
+        .unwrap();
+        let res1 = anth.chat_with_tools(base_req.clone()).await.unwrap();
+        assert_eq!(res1.tool_calls.len(), 1);
+        assert_eq!(res1.tool_calls[0].id, "tu_1");
+        assert_eq!(res1.tool_calls[0].name, "git_search_commits");
+        assert_eq!(res1.tool_calls[0].arguments["query"], "auth");
+
+        let mut follow_req = base_req.clone();
+        follow_req.messages.push(ToolChatMessage::Assistant {
+            content: res1.content,
+            tool_calls: res1.tool_calls,
+        });
+        follow_req.messages.push(ToolChatMessage::ToolResult {
+            tool_call_id: "tu_1".to_owned(),
+            tool_name: "git_search_commits".to_owned(),
+            content: "abc123 feat: add auth".to_owned(),
+            is_error: false,
+        });
+        let res2 = anth.chat_with_tools(follow_req).await.unwrap();
+        assert!(res2.tool_calls.is_empty());
+        assert_eq!(res2.content, "Found commit abc123.");
+        assert!(reqs.lock().unwrap()[1].contains("\"tool_result\""));
+
+        // 2. OpenAI function tool_calls
+        let oai_r1 = json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "git_search_commits",
+                            "arguments": "{\"query\":\"auth\"}"
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let (base, _reqs) = spawn_mock_http(vec![oai_r1]).await;
+        let oai = ProviderModel::new(
+            ModelSpec::parse("openai::gpt-4.1").unwrap(),
+            Some("test-key".to_owned()),
+            base,
+        )
+        .unwrap();
+        let oai_res = oai.chat_with_tools(base_req.clone()).await.unwrap();
+        assert_eq!(
+            oai_res.tool_calls,
+            vec![ToolCall {
+                id: "call_1".to_owned(),
+                name: "git_search_commits".to_owned(),
+                arguments: json!({"query": "auth"}),
+            }]
+        );
+
+        // 3. Gemini functionCall + cassette record/replay
+        let gem_r1 = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "git_search_commits",
+                            "args": { "query": "auth" }
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let (base, _reqs) = spawn_mock_http(vec![gem_r1]).await;
+        let gem = ProviderModel::new(
+            ModelSpec::parse("gemini::gemini-2.5-pro").unwrap(),
+            Some("test-key".to_owned()),
+            base,
+        )
+        .unwrap();
+        let cassette_path = std::env::temp_dir().join(format!(
+            "git-untangle-tool-chat-cassette-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&cassette_path);
+        let recorder = RecordingModel::new(gem, &cassette_path);
+        let live_res = recorder.chat_with_tools(base_req.clone()).await.unwrap();
+        assert_eq!(live_res.tool_calls.len(), 1);
+        assert_eq!(live_res.tool_calls[0].name, "git_search_commits");
+
+        let replayer = ReplayModel::from_jsonl_file(&cassette_path).unwrap();
+        let replayed = replayer.chat_with_tools(base_req).await.unwrap();
+        assert_eq!(replayed, live_res);
+        let _ = std::fs::remove_file(&cassette_path);
     });
 }

@@ -107,6 +107,18 @@ pub fn build_diagnosis_schema() -> Value {
     })
 }
 
+/// JSON Schema for `AutoCommitMessageDraft` (`git chat commit`).
+pub fn auto_commit_message_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "subject": { "type": "string" },
+            "body": { "type": "string" }
+        },
+        "required": ["subject", "body"]
+    })
+}
+
 /// JSON Schema for `CommitMessageProposal`.
 pub fn commit_messages_schema() -> Value {
     json!({
