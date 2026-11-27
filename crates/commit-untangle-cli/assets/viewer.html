@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>git-untangle Viewer</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #1e293b;
+      --panel-alt: #273549;
+      --border: #334155;
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --green: #4ade80;
+      --amber: #fbbf24;
+      --red: #f87171;
+      --purple: #c084fc;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+    header {
+      padding: 12px 20px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .title-group h1 { margin: 0; font-size: 16px; font-weight: 600; }
+    .title-group .sub { font-size: 12px; color: var(--muted); margin-top: 3px; font-family: ui-monospace, monospace; }
+    .badges { display: flex; gap: 8px; flex-wrap: wrap; font-size: 12px; }
+    .badge {
+      padding: 4px 9px;
+      border-radius: 999px;
+      background: var(--panel-alt);
+      border: 1px solid var(--border);
+    }
+    .badge.ok { border-color: #166534; color: var(--green); }
+    .badge.warn { border-color: #92400e; color: var(--amber); }
+    .workspace {
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      flex: 1;
+      min-height: 0;
+    }
+    aside {
+      border-right: 1px solid var(--border);
+      background: var(--panel);
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    .controls {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    input[type="search"], select {
+      width: 100%;
+      padding: 6px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      font-size: 13px;
+    }
+    .op-list {
+      overflow-y: auto;
+      flex: 1;
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .op-card {
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      cursor: pointer;
+      transition: border-color 0.15s;
+    }
+    .op-card:hover { border-color: var(--muted); }
+    .op-card.active { border-color: var(--accent); background: #13233a; }
+    .op-card .op-head { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+    .op-card .op-title { font-size: 13px; font-weight: 600; line-height: 1.35; }
+    main {
+      display: grid;
+      grid-template-rows: 230px 1fr;
+      min-height: 0;
+    }
+    .dag-pane {
+      border-bottom: 1px solid var(--border);
+      background: #0b1120;
+      overflow: auto;
+      position: relative;
+    }
+    .detail-pane {
+      overflow-y: auto;
+      padding: 18px 22px;
+    }
+    .meta-grid {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      font-size: 12px;
+      color: var(--muted);
+      margin: 8px 0 14px;
+      font-family: ui-monospace, monospace;
+    }
+    pre.diff {
+      background: #090d16;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      overflow-x: auto;
+      font-size: 12px;
+      line-height: 1.45;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      margin: 8px 0 16px;
+    }
+    .diff-add { color: var(--green); }
+    .diff-del { color: var(--red); }
+    .diff-hdr { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title-group">
+      <h1 id="hdr-title">git-untangle</h1>
+      <div class="sub" id="hdr-sub"></div>
+    </div>
+    <div class="badges" id="hdr-badges"></div>
+  </header>
+  <div class="workspace">
+    <aside>
+      <div class="controls">
+        <input type="search" id="search" placeholder="Filter operations or files..." />
+        <select id="cat-filter">
+          <option value="">All categories</option>
+        </select>
+      </div>
+      <div class="op-list" id="op-list"></div>
+    </aside>
+    <main>
+      <div class="dag-pane" id="dag-pane"></div>
+      <div class="detail-pane" id="detail-pane"></div>
+    </main>
+  </div>
+  <script>
+    const VIEWER_CONFIG = /*CONFIG_START*/{"title":"git-untangle","data":null}/*CONFIG_END*/;
+    const data = VIEWER_CONFIG.data || { operations: [], edges: [], series: {} };
+    document.title = VIEWER_CONFIG.title || "git-untangle Viewer";
+    document.getElementById("hdr-title").textContent = VIEWER_CONFIG.title || data.subject || "Commit Analysis";
+    document.getElementById("hdr-sub").textContent = `${(data.parent || "").slice(0, 10)} -> ${(data.commit || "").slice(0, 10)}`;
+
+    const badgesEl = document.getElementById("hdr-badges");
+    function addBadge(text, cls) {
+      const span = document.createElement("span");
+      span.className = "badge " + (cls || "");
+      span.textContent = text;
+      badgesEl.appendChild(span);
+    }
+    addBadge(`${data.operations.length} operations`);
+    addBadge(`${(data.edges || []).length} edges`);
+    addBadge(data.exact_reconstruction ? "Exact reconstruction" : "Reconstruction mismatch", data.exact_reconstruction ? "ok" : "warn");
+    if (data.series && data.series.branch) addBadge(`branch: ${data.series.branch}`, "ok");
+
+    const cats = [...new Set(data.operations.map(o => o.category))].sort();
+    const catSelect = document.getElementById("cat-filter");
+    cats.forEach(c => {
+      const opt = document.createElement("option");
+      opt.value = c;
+      opt.textContent = c;
+      catSelect.appendChild(opt);
+    });
+
+    let selectedId = data.operations[0] ? data.operations[0].id : null;
+
+    function computeDepths(ops, edges) {
+      const depths = {};
+      ops.forEach(o => { depths[o.id] = 0; });
+      for (let pass = 0; pass < ops.length; pass++) {
+        (edges || []).forEach(e => {
+          if (depths[e.before] !== undefined && depths[e.after] !== undefined) {
+            depths[e.after] = Math.max(depths[e.after], depths[e.before] + 1);
+          }
+        });
+      }
+      return depths;
+    }
+
+    function renderDag() {
+      const pane = document.getElementById("dag-pane");
+      pane.innerHTML = "";
+      const ops = data.operations;
+      if (!ops.length) return;
+      const depths = computeDepths(ops, data.edges);
+      const cols = {};
+      ops.forEach(o => {
+        const d = depths[o.id] || 0;
+        (cols[d] = cols[d] || []).push(o);
+      });
+      const maxCol = Math.max(0, ...Object.keys(cols).map(Number));
+      const maxRows = Math.max(1, ...Object.values(cols).map(l => l.length));
+      const nodeW = 165, nodeH = 44, gapX = 65, gapY = 18, pad = 24;
+      const width = pad * 2 + (maxCol + 1) * nodeW + maxCol * gapX;
+      const height = Math.max(210, pad * 2 + maxRows * nodeH + (maxRows - 1) * gapY);
+
+      const pos = {};
+      Object.entries(cols).forEach(([colStr, list]) => {
+        const c = Number(colStr);
+        list.forEach((o, r) => {
+          pos[o.id] = { x: pad + c * (nodeW + gapX), y: pad + r * (nodeH + gapY) };
+        });
+      });
+
+      const ns = "http://www.w3.org/2000/svg";
+      const svg = document.createElementNS(ns, "svg");
+      svg.setAttribute("width", String(width));
+      svg.setAttribute("height", String(height));
+
+      (data.edges || []).forEach(e => {
+        const a = pos[e.before], b = pos[e.after];
+        if (!a || !b) return;
+        const x1 = a.x + nodeW, y1 = a.y + nodeH / 2;
+        const x2 = b.x, y2 = b.y + nodeH / 2;
+        const mx = (x1 + x2) / 2;
+        const path = document.createElementNS(ns, "path");
+        path.setAttribute("d", `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`);
+        path.setAttribute("fill", "none");
+        path.setAttribute("stroke", e.kind === "semantic" ? "#c084fc" : "#38bdf8");
+        path.setAttribute("stroke-width", "1.75");
+        path.setAttribute("opacity", "0.75");
+        svg.appendChild(path);
+      });
+
+      ops.forEach(o => {
+        const p = pos[o.id];
+        const g = document.createElementNS(ns, "g");
+        g.style.cursor = "pointer";
+        g.addEventListener("click", () => { selectedId = o.id; refresh(); });
+
+        const rect = document.createElementNS(ns, "rect");
+        rect.setAttribute("x", String(p.x));
+        rect.setAttribute("y", String(p.y));
+        rect.setAttribute("width", String(nodeW));
+        rect.setAttribute("height", String(nodeH));
+        rect.setAttribute("rx", "7");
+        rect.setAttribute("fill", o.id === selectedId ? "#1e3a5f" : "#1e293b");
+        rect.setAttribute("stroke", o.id === selectedId ? "#38bdf8" : "#475569");
+        rect.setAttribute("stroke-width", o.id === selectedId ? "2" : "1");
+        g.appendChild(rect);
+
+        const t1 = document.createElementNS(ns, "text");
+        t1.setAttribute("x", String(p.x + 10));
+        t1.setAttribute("y", String(p.y + 17));
+        t1.setAttribute("fill", "#94a3b8");
+        t1.setAttribute("font-size", "10");
+        t1.textContent = `${o.id} · ${o.category}`;
+        g.appendChild(t1);
+
+        const t2 = document.createElementNS(ns, "text");
+        t2.setAttribute("x", String(p.x + 10));
+        t2.setAttribute("y", String(p.y + 33));
+        t2.setAttribute("fill", "#f1f5f9");
+        t2.setAttribute("font-size", "11");
+        t2.textContent = o.name.length > 22 ? o.name.slice(0, 21) + "…" : o.name;
+        g.appendChild(t2);
+
+        svg.appendChild(g);
+      });
+      pane.appendChild(svg);
+    }
+
+    function escapeHtml(str) {
+      return (str || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    function formatDiffHtml(raw) {
+      return (raw || "").split("\n").map(line => {
+        const esc = escapeHtml(line);
+        if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("@@")) {
+          return `<span class="diff-hdr">${esc}</span>`;
+        } else if (line.startsWith("+")) {
+          return `<span class="diff-add">${esc}</span>`;
+        } else if (line.startsWith("-")) {
+          return `<span class="diff-del">${esc}</span>`;
+        }
+        return esc;
+      }).join("\n");
+    }
+
+    function renderDetail() {
+      const pane = document.getElementById("detail-pane");
+      const op = data.operations.find(o => o.id === selectedId);
+      if (!op) {
+        pane.innerHTML = "<p>Select an operation to inspect its items and atomic diffs.</p>";
+        return;
+      }
+      const inEdges = (data.edges || []).filter(e => e.after === op.id);
+      const outEdges = (data.edges || []).filter(e => e.before === op.id);
+      let html = `<h2>${escapeHtml(op.id)}: ${escapeHtml(op.name)}</h2>`;
+      html += `<div class="meta-grid">
+        <span>category: ${escapeHtml(op.category)}</span>
+        <span>mechanical: ${op.mechanical}</span>
+        <span>confidence: ${(op.confidence || 0).toFixed(2)}</span>
+        ${op.commit ? `<span>head: ${escapeHtml(op.commit.slice(0, 10))}</span>` : ""}
+        ${op.base_commit ? `<span>base: ${escapeHtml(op.base_commit.slice(0, 10))}</span>` : ""}
+      </div>`;
+      html += `<p>${escapeHtml(op.description)}</p>`;
+      if (op.rule) html += `<p><code>Rule: ${escapeHtml(op.rule)}</code></p>`;
+      if (inEdges.length) {
+        html += `<p><strong>Prerequisites:</strong> ${inEdges.map(e => `${escapeHtml(e.before)} (${escapeHtml(e.kind)}: ${escapeHtml(e.reason)})`).join("; ")}</p>`;
+      }
+      if (outEdges.length) {
+        html += `<p><strong>Required by:</strong> ${outEdges.map(e => `${escapeHtml(e.after)} (${escapeHtml(e.kind)})`).join(", ")}</p>`;
+      }
+      html += `<h3>Change Items (${op.items.length})</h3>`;
+      op.items.forEach(it => {
+        const loc = it.line_start ? `:${it.line_start}` : "";
+        html += `<div><strong>${escapeHtml(it.id)}</strong> · <code>${escapeHtml(it.kind)}</code> · <code>${escapeHtml(it.file)}${loc}</code> ${it.commit ? `· <code>${escapeHtml(it.commit.slice(0, 10))}</code>` : ""}</div>`;
+        if (it.diff_preview) {
+          html += `<pre class="diff">${formatDiffHtml(it.diff_preview)}</pre>`;
+        }
+      });
+      pane.innerHTML = html;
+    }
+
+    function renderList() {
+      const q = document.getElementById("search").value.trim().toLowerCase();
+      const cat = catSelect.value;
+      const listEl = document.getElementById("op-list");
+      listEl.innerHTML = "";
+      data.operations.filter(o => {
+        if (cat && o.category !== cat) return false;
+        if (!q) return true;
+        return o.name.toLowerCase().includes(q)
+          || o.description.toLowerCase().includes(q)
+          || (o.files || []).some(f => f.toLowerCase().includes(q));
+      }).forEach(o => {
+        const div = document.createElement("div");
+        div.className = "op-card" + (o.id === selectedId ? " active" : "");
+        div.innerHTML = `<div class="op-head"><span>${escapeHtml(o.id)} · ${escapeHtml(o.category)}${o.mechanical ? " · mech" : ""}</span><span>${o.items.length} item(s)</span></div>
+                         <div class="op-title">${escapeHtml(o.name)}</div>`;
+        div.addEventListener("click", () => { selectedId = o.id; refresh(); });
+        listEl.appendChild(div);
+      });
+    }
+
+    function refresh() {
+      renderList();
+      renderDag();
+      renderDetail();
+    }
+    document.getElementById("search").addEventListener("input", renderList);
+    catSelect.addEventListener("change", renderList);
+    refresh();
+  </script>
+</body>
+</html>
