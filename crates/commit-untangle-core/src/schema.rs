@@ -31,6 +31,12 @@ pub struct ItemArtifact {
     pub new_line_count: Option<usize>,
     pub fingerprint: String,
     pub commit: Option<String>,
+    /// Resolved commit subject line when materialized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_subject: Option<String>,
+    /// Resolved commit body description (excluding trailers) when materialized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_body: Option<String>,
     pub diff: Option<String>,
     /// Optional inline preview diff (UTF-8 lossy) so standalone viewers work even without patch files.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -74,6 +80,8 @@ pub struct SeriesMetadata {
     pub branch_created: Option<String>,
     pub branch_error: Option<String>,
     pub item_commits: IndexMap<String, String>,
+    pub item_subjects: IndexMap<String, String>,
+    pub item_bodies: IndexMap<String, String>,
     pub item_diff_files: IndexMap<String, String>,
     pub item_diff_previews: IndexMap<String, String>,
     pub operation_commits: IndexMap<String, String>,
@@ -145,6 +153,8 @@ pub fn build_analysis_artifact(
                         new_line_count: item.hunk.as_ref().map(|h| h.new_lines.len()),
                         fingerprint: item.fingerprint.clone(),
                         commit: series.item_commits.get(&item.id).cloned(),
+                        commit_subject: series.item_subjects.get(&item.id).cloned(),
+                        commit_body: series.item_bodies.get(&item.id).cloned(),
                         diff: series.item_diff_files.get(&item.id).cloned(),
                         diff_preview: series.item_diff_previews.get(&item.id).cloned(),
                         defines,

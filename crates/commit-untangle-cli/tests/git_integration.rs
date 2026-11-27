@@ -786,3 +786,279 @@ fn test_git_chat_interactive_session_and_configurable_byte_limit() {
     assert!(stdout.contains(reply2));
     assert!(stderr.contains("limit: 512 bytes, truncated"));
 }
+
+#[test]
+fn test_live_http_llm_sliced_commit_descriptions_and_404_model_failure() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    let repo = init_repo();
+    let r = repo.path();
+
+    fs::write(r.join("README.md"), "# Demo\n").unwrap();
+    git(r, &["add", "README.md"]);
+    git(r, &["commit", "-m", "docs: initial readme"]);
+
+    // Add 15 new files (> MAX_ITEMS_PER_COMMIT_MSG_BATCH = 12) + Cargo.lock so we exercise:
+    // 1. Multi-slice commit message authoring across all 15 semantic items in `op1`
+    // 2. Separate `op2` generated lockfile operation with `item_subjects: null`
+    // 3. Final merge commit listing LLM-authored operation summaries
+    fs::create_dir_all(r.join("src")).unwrap();
+    let mut shared_lines = String::new();
+    for idx in 1..=15 {
+        fs::write(
+            r.join(format!("src/mod_{idx:02}.rs")),
+            format!("pub fn shared_ core_anchor() {{}}\npub fn feature_{idx:02}() -> usize {{ {idx} }}\n")
+                .replace("shared_ core_anchor", "shared_core_anchor"),
+        )
+        .unwrap();
+        shared_lines.push_str(&format!("pub mod mod_{idx:02};\n"));
+    }
+    fs::write(r.join("Cargo.lock"), "# lockfile\nversion = 3\n").unwrap();
+    git(r, &["add", "-A"]);
+    git(
+        r,
+        &["commit", "-m", "feat: add 15 feature modules and lockfile"],
+    );
+
+    // Case A: Invalid model (`anthropic::claude-haiku-5-5`) returning HTTP 404 must fail fast (exit 2)
+    // instead of silently producing heuristic `Add 15 files` commits!
+    let listener_404 = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr_404 = listener_404.local_addr().unwrap();
+    let server_404 = thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener_404.accept() {
+            let mut buf = [0u8; 16384];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"type":"error","error":{"type":"not_found_error","message":"model: claude-haiku-5-5"}}"#;
+            let resp = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+
+    let bad_model_out = Command::new(bin_git_untangle())
+        .current_dir(r)
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", format!("http://{addr_404}"))
+        .args(["HEAD", "--model", "anthropic::claude-haiku-5-5"])
+        .output()
+        .unwrap();
+    let _ = server_404.join();
+    assert_eq!(
+        bad_model_out.status.code(),
+        Some(2),
+        "404 invalid model must fail with EXIT_USAGE_OR_CONFIG (2), stderr: {}",
+        String::from_utf8_lossy(&bad_model_out.stderr)
+    );
+    let bad_stderr = String::from_utf8_lossy(&bad_model_out.stderr);
+    assert!(bad_stderr.contains("404"));
+    assert!(bad_stderr.contains("--model"));
+
+    // Case B: Valid Anthropic responses across Stage 2B, Stage 3B, and multi-slice Stage 4B!
+    let listener_ok = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr_ok = listener_ok.local_addr().unwrap();
+    let server_ok = thread::spawn(move || {
+        // Serve dynamically based on prompt content so concurrent Stage 4B slices work in any order!
+        for _ in 0..5 {
+            let Ok((mut stream, _)) = listener_ok.accept() else {
+                break;
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .ok();
+            let mut req_bytes = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        req_bytes.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&req_bytes);
+                        if let Some(hdr_end) = text.find("\r\n\r\n") {
+                            let hdrs = &text[..hdr_end];
+                            let cl = hdrs
+                                .lines()
+                                .find_map(|l| {
+                                    let lower = l.to_ascii_lowercase();
+                                    lower
+                                        .strip_prefix("content-length:")
+                                        .and_then(|v| v.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if req_bytes.len() >= hdr_end + 4 + cl {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let req_str = String::from_utf8_lossy(&req_bytes);
+            let reply_json = if req_str.contains("Candidate Clusters") {
+                serde_json::json!({
+                    "actions": [],
+                    "labels": {
+                        "c1": {
+                            "name": "Add modular feature implementations",
+                            "description": "Initializes the 15 feature modules.",
+                            "category": "feature"
+                        }
+                    }
+                })
+            } else if req_str.contains("Known (Syntactic) Dependencies") {
+                serde_json::json!({
+                    "edges": [],
+                    "suggested_order": ["op1", "op2"]
+                })
+            } else if req_str.contains("slice 1/2") {
+                let mut subs = serde_json::Map::new();
+                let mut bodies = serde_json::Map::new();
+                for item_num in 2..=13 {
+                    let mod_idx = item_num - 1;
+                    subs.insert(
+                        format!("i{item_num}"),
+                        serde_json::Value::String(format!(
+                            "feat(mod_{mod_idx:02}): implement feature_{mod_idx:02} entry"
+                        )),
+                    );
+                    bodies.insert(
+                        format!("i{item_num}"),
+                        serde_json::Value::String(format!(
+                            "Adds src/mod_{mod_idx:02}.rs providing feature_{mod_idx:02}()."
+                        )),
+                    );
+                }
+                serde_json::json!({
+                    "messages": {
+                        "op1": {
+                            "subject": "feat: add 15 modular feature units",
+                            "body": "Introduces all 15 feature modules sharing the core anchor API.",
+                            "item_subjects": subs,
+                            "item_bodies": bodies
+                        }
+                    }
+                })
+            } else if req_str.contains("slice 2/2") {
+                let mut subs = serde_json::Map::new();
+                let mut bodies = serde_json::Map::new();
+                for item_num in 14..=16 {
+                    let mod_idx = item_num - 1;
+                    subs.insert(
+                        format!("i{item_num}"),
+                        serde_json::Value::String(format!(
+                            "feat(mod_{mod_idx:02}): implement feature_{mod_idx:02} entry"
+                        )),
+                    );
+                    bodies.insert(
+                        format!("i{item_num}"),
+                        serde_json::Value::String(format!(
+                            "Adds src/mod_{mod_idx:02}.rs providing feature_{mod_idx:02}()."
+                        )),
+                    );
+                }
+                serde_json::json!({
+                    "messages": {
+                        "op1": {
+                            "subject": "feat: add 15 modular feature units",
+                            "body": "Introduces all 15 feature modules sharing the core anchor API.",
+                            "item_subjects": subs,
+                            "item_bodies": bodies
+                        }
+                    }
+                })
+            } else {
+                // `op2` single-item Cargo.lock batch with explicit null `item_subjects`
+                serde_json::json!({
+                    "messages": {
+                        "op2": {
+                            "subject": "chore(deps): record Cargo.lock v3 metadata",
+                            "body": "Captures resolved workspace lockfile state.",
+                            "item_subjects": null
+                        }
+                    }
+                })
+            };
+
+            let envelope = serde_json::json!({
+                "content": [{ "type": "text", "text": reply_json.to_string() }],
+                "stop_reason": "end_turn"
+            })
+            .to_string();
+            let http_resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                envelope.len(),
+                envelope
+            );
+            let _ = stream.write_all(http_resp.as_bytes());
+        }
+    });
+
+    let out_dir = r.join("llm-sliced-out");
+    let ok_out = Command::new(bin_git_untangle())
+        .current_dir(r)
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", format!("http://{addr_ok}"))
+        .args([
+            "HEAD",
+            "--model",
+            "anthropic::claude-haiku-4-5",
+            "--branch",
+            "untangled/llm-sliced",
+            "--output-dir",
+            out_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let _ = server_ok.join();
+
+    assert_eq!(
+        ok_out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&ok_out.stderr)
+    );
+    let art: AnalysisArtifact = serde_json::from_slice(&ok_out.stdout).unwrap();
+    assert_eq!(art.operations.len(), 2);
+    assert_eq!(art.operations[0].name, "feat: add 15 modular feature units");
+    assert_eq!(
+        art.operations[1].name,
+        "chore(deps): record Cargo.lock v3 metadata"
+    );
+
+    // Every single item commit (including slice 2 items i14..i16!) must carry its LLM-authored subject & body!
+    let full_log = git(
+        r,
+        &["log", "--format=%s%n%b---", "HEAD~1..untangled/llm-sliced"],
+    );
+    assert!(
+        full_log.contains("feat(mod_01): implement feature_01 entry"),
+        "slice 1 item subject missing from git log:\n{full_log}"
+    );
+    assert!(
+        full_log.contains("feat(mod_15): implement feature_15 entry"),
+        "slice 2 item subject missing from git log:\n{full_log}"
+    );
+    assert!(
+        full_log.contains("Adds src/mod_15.rs providing feature_15()."),
+        "per-item commit description missing from git log:\n{full_log}"
+    );
+    assert!(
+        full_log.contains("Operation context: Introduces all 15 feature modules"),
+        "operation context missing from multi-item commit body:\n{full_log}"
+    );
+    assert!(
+        full_log.contains("chore(deps): record Cargo.lock v3 metadata"),
+        "op2 commit subject missing from git log:\n{full_log}"
+    );
+    // Final merge commit at branch tip must summarize the LLM-authored operations!
+    let head_msg = git(r, &["log", "-1", "--format=%B", "untangled/llm-sliced"]);
+    assert!(
+        head_msg.contains("op1 [feature]: feat: add 15 modular feature units"),
+        "final merge commit should list LLM-authored operation titles:\n{head_msg}"
+    );
+}

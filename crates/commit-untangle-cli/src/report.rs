@@ -158,7 +158,7 @@ pub fn build_markdown_report(
 
     out.push_str("## Operations in Order\n\n");
     for (idx, op) in order.iter().enumerate() {
-        out.push_str(&operation_markdown(idx + 1, op, items));
+        out.push_str(&operation_markdown(idx + 1, op, items, series));
         out.push('\n');
     }
 
@@ -209,7 +209,12 @@ pub fn build_markdown_report(
     out
 }
 
-fn operation_markdown(num: usize, op: &Operation, items: &IndexMap<String, ChangeItem>) -> String {
+fn operation_markdown(
+    num: usize,
+    op: &Operation,
+    items: &IndexMap<String, ChangeItem>,
+    series: &SeriesMetadata,
+) -> String {
     let mut s = String::new();
     let flag = if op.suspicious { " [SUSPICIOUS]" } else { "" };
     let ver = match op.verified {
@@ -253,8 +258,18 @@ fn operation_markdown(num: usize, op: &Operation, items: &IndexMap<String, Chang
                 .as_ref()
                 .map(|h| format!(":{}", h.start + 1))
                 .unwrap_or_default();
+            let subj_note = if op.item_ids.len() > 1 {
+                series
+                    .item_subjects
+                    .get(id)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| format!(" — {s}"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             s.push_str(&format!(
-                "- {} {} `{}{loc}`\n",
+                "- {} {} `{}{loc}`{subj_note}\n",
                 item.id,
                 item.kind.as_str(),
                 item.display_path

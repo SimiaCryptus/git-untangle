@@ -7,6 +7,7 @@ pub mod viewer;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use commit_untangle_core::cluster::{
@@ -15,8 +16,8 @@ use commit_untangle_core::cluster::{
 use commit_untangle_core::graph::ChangeGraph;
 use commit_untangle_core::model::{parse_and_classify, ChangeItem, FileChange, Operation};
 use commit_untangle_core::proposal::{
-    apply_cluster_proposal, BuildDiagnosisProposal, ClusterRefinementProposal, CommitMessageDraft,
-    CommitMessageProposal, DependencyProposal,
+    apply_cluster_proposal, normalize_entity_id, BuildDiagnosisProposal, ClusterRefinementProposal,
+    CommitMessageDraft, CommitMessageProposal, DependencyProposal,
 };
 use commit_untangle_core::replay::verify_exact_reconstruction;
 use commit_untangle_core::schema::build_analysis_artifact;
@@ -27,14 +28,15 @@ use commit_untangle_core::{build_deterministic_plan, DeterministicPlanConfig};
 use commit_untangle_git::worktree::{run_verify_command, TempWorktree, WorktreeReplayer};
 use commit_untangle_git::{EmitOptions, GitBackend, GitCliBackend, GitError, TargetSpec};
 use commit_untangle_llm::prompts::{
-    batch_clusters, batch_operations, build_cluster_refinement_request,
-    build_commit_messages_request, build_dependency_request, build_diagnosis_request,
-    DEFAULT_BATCH_CHAR_BUDGET,
+    batch_clusters, build_cluster_refinement_request, build_commit_message_batch_request,
+    build_dependency_request, build_diagnosis_request, plan_commit_message_batches,
+    CommitMessageBatch, DEFAULT_BATCH_CHAR_BUDGET,
 };
 use commit_untangle_llm::{
-    generate_typed, ProviderModel, RecordingModel, ReplayModel, SemanticModel,
+    generate_typed, LlmError, ProviderModel, RecordingModel, ReplayModel, SemanticModel,
 };
 use indexmap::IndexMap;
+use tokio::sync::Semaphore;
 
 use crate::config::{resolve_config, CliArgs, EmitTarget, ResolvedConfig};
 use crate::packaging::{
@@ -178,7 +180,21 @@ where
     }
 }
 
-fn build_semantic_model(cfg: &ResolvedConfig) -> Result<Option<Box<dyn SemanticModel>>, String> {
+const MAX_CONCURRENT_COMMIT_MSG_BATCHES: usize = 3;
+
+enum PlanBuildError {
+    Core(commit_untangle_core::error::CoreError),
+    FatalLlm(LlmError),
+}
+
+fn print_fatal_llm_error(err: &LlmError) {
+    eprintln!("error: LLM request failed: {err}");
+    if let Some(hint) = err.diagnostic_hint() {
+        eprintln!("hint: {hint}");
+    }
+}
+
+fn build_semantic_model(cfg: &ResolvedConfig) -> Result<Option<Arc<dyn SemanticModel>>, String> {
     if !cfg.use_llm {
         return Ok(None);
     }
@@ -187,9 +203,9 @@ fn build_semantic_model(cfg: &ResolvedConfig) -> Result<Option<Box<dyn SemanticM
         let model = ReplayModel::from_jsonl_file(replay_path)
             .map_err(|e| format!("failed to load cassette '{}': {e}", replay_path.display()))?;
         return if let Some(ref rec_path) = cfg.record_llm {
-            Ok(Some(Box::new(RecordingModel::new(model, rec_path))))
+            Ok(Some(Arc::new(RecordingModel::new(model, rec_path))))
         } else {
-            Ok(Some(Box::new(model)))
+            Ok(Some(Arc::new(model)))
         };
     }
 
@@ -199,9 +215,9 @@ fn build_semantic_model(cfg: &ResolvedConfig) -> Result<Option<Box<dyn SemanticM
         .ok_or_else(|| "LLM mode enabled without --model or untangle.model (pass --no-llm for deterministic mode)".to_owned())?;
     let live = ProviderModel::from_env(model_spec).map_err(|e| e.to_string())?;
     if let Some(ref rec_path) = cfg.record_llm {
-        Ok(Some(Box::new(RecordingModel::new(live, rec_path))))
+        Ok(Some(Arc::new(RecordingModel::new(live, rec_path))))
     } else {
-        Ok(Some(Box::new(live)))
+        Ok(Some(Arc::new(live)))
     }
 }
 
@@ -296,7 +312,11 @@ pub async fn run_untangle(cfg: ResolvedConfig) -> i32 {
         .await
         {
             Ok(res) => res,
-            Err(e) => {
+            Err(PlanBuildError::FatalLlm(err)) => {
+                print_fatal_llm_error(&err);
+                return EXIT_USAGE_OR_CONFIG;
+            }
+            Err(PlanBuildError::Core(e)) => {
                 eprintln!("error: plan construction failed: {e}");
                 return EXIT_INVARIANT_VIOLATION;
             }
@@ -369,31 +389,101 @@ pub async fn run_untangle(cfg: ResolvedConfig) -> i32 {
 
     // Stage 4B: LLM-authored commit messages when LLM is active
     let commit_messages = if let Some(ref model) = semantic_model {
-        status(&format!(
-            "[git-untangle] Authoring commit messages for {} operation(s) with LLM",
-            order.len()
-        ));
-        let drafted =
-            author_commit_messages(&order, &target.message, &parsed.items, model.as_ref()).await;
+        let planned_batches =
+            plan_commit_message_batches(&order, &parsed.items, DEFAULT_BATCH_CHAR_BUDGET);
+        if planned_batches.len() > 1 {
+            status(&format!(
+                "[git-untangle] Authoring commit messages for {} operation(s) ({} item(s) across {} LLM batch(es))",
+                order.len(),
+                parsed.items.len(),
+                planned_batches.len()
+            ));
+        } else {
+            status(&format!(
+                "[git-untangle] Authoring commit messages for {} operation(s) with LLM",
+                order.len()
+            ));
+        }
+        let drafted = match author_commit_messages(
+            &planned_batches,
+            &target.message,
+            &parsed.items,
+            Arc::clone(model),
+            cfg.quiet,
+        )
+        .await
+        {
+            Ok(d) => d,
+            Err(fatal_err) => {
+                print_fatal_llm_error(&fatal_err);
+                return EXIT_USAGE_OR_CONFIG;
+            }
+        };
+
+        let mut authored_ops = 0usize;
+        let mut authored_items = 0usize;
         for op in &mut order {
             if let Some(d) = drafted.get(&op.id) {
-                if !d.subject.trim().is_empty() {
-                    op.name = d.subject.trim().chars().take(120).collect();
+                let has_subj = !d.subject.trim().is_empty();
+                let has_body = !d.body.trim().is_empty();
+                if has_subj {
+                    op.name = d
+                        .subject
+                        .trim()
+                        .trim_end_matches('.')
+                        .chars()
+                        .take(120)
+                        .collect();
                 }
-                if !d.body.trim().is_empty() {
+                if has_body {
                     op.description = d.body.trim().to_owned();
+                }
+                if has_subj || has_body || !d.item_subjects.is_empty() {
+                    authored_ops += 1;
+                    op.confidence = op.confidence.max(0.75);
+                }
+                for item_id in &op.item_ids {
+                    if d.item_subjects.contains_key(item_id)
+                        || (op.item_ids.len() == 1 && has_subj)
+                        || d.item_bodies.contains_key(item_id)
+                        || has_body
+                    {
+                        authored_items += 1;
+                    }
                 }
             }
         }
         for op in &mut graph.ops {
             if let Some(d) = drafted.get(&op.id) {
-                if !d.subject.trim().is_empty() {
-                    op.name = d.subject.trim().chars().take(120).collect();
+                let has_subj = !d.subject.trim().is_empty();
+                let has_body = !d.body.trim().is_empty();
+                if has_subj {
+                    op.name = d
+                        .subject
+                        .trim()
+                        .trim_end_matches('.')
+                        .chars()
+                        .take(120)
+                        .collect();
                 }
-                if !d.body.trim().is_empty() {
+                if has_body {
                     op.description = d.body.trim().to_owned();
                 }
+                if has_subj || has_body || !d.item_subjects.is_empty() {
+                    op.confidence = op.confidence.max(0.75);
+                }
             }
+        }
+        if authored_ops == 0 && !order.is_empty() && !cfg.quiet {
+            eprintln!(
+                "[git-untangle] warning: LLM produced 0 usable commit descriptions; falling back to heuristic messages"
+            );
+        } else {
+            status(&format!(
+                "[git-untangle] Authored LLM commit descriptions for {authored_ops}/{} operation(s) ({authored_items}/{} item commit(s))",
+                order.len(),
+                parsed.items.len()
+            ));
         }
         drafted
     } else {
@@ -565,10 +655,7 @@ async fn build_model_refined_plan(
     commit_context: &str,
     cfg: &ResolvedConfig,
     model: &dyn SemanticModel,
-) -> Result<
-    (ChangeGraph, Vec<Operation>, IndexMap<String, usize>),
-    commit_untangle_core::error::CoreError,
-> {
+) -> Result<(ChangeGraph, Vec<Operation>, IndexMap<String, usize>), PlanBuildError> {
     let mechanical_ops = mechanical_operations(items, files);
     let generated_ops = generated_operations(items, files);
 
@@ -588,12 +675,26 @@ async fn build_model_refined_plan(
 
     let mut semantic_ops = Vec::new();
     let batches = batch_clusters(&cluster_ids, items, DEFAULT_BATCH_CHAR_BUDGET);
-    for batch in batches {
+    for (batch_idx, batch) in batches.into_iter().enumerate() {
         let req = build_cluster_refinement_request(&batch, commit_context, items);
-        let proposal = generate_typed::<ClusterRefinementProposal>(model, req)
-            .await
-            .unwrap_or_default();
-        semantic_ops.extend(apply_cluster_proposal(&batch, &proposal, items)?);
+        let proposal = match generate_typed::<ClusterRefinementProposal>(model, req).await {
+            Ok(p) => p,
+            Err(err) if err.is_fatal_config_or_auth() => {
+                return Err(PlanBuildError::FatalLlm(err));
+            }
+            Err(err) => {
+                if !cfg.quiet {
+                    eprintln!(
+                        "[git-untangle] warning: LLM cluster refinement batch {} failed ({err}); using deterministic clusters",
+                        batch_idx + 1
+                    );
+                }
+                ClusterRefinementProposal::default()
+            }
+        };
+        semantic_ops.extend(
+            apply_cluster_proposal(&batch, &proposal, items).map_err(PlanBuildError::Core)?,
+        );
     }
 
     semantic_ops.sort_by_key(|op| op.position(items));
@@ -614,13 +715,27 @@ async fn build_model_refined_plan(
     let mut llm_ranks = IndexMap::new();
     if graph.ops.len() >= 2 && graph.ops.len() <= cfg.max_llm_ops {
         let req = build_dependency_request(&graph, commit_context, items);
-        if let Ok(prop) = generate_typed::<DependencyProposal>(model, req).await {
-            let (_, _, ranks) = graph.apply_dependency_proposal(&prop);
-            llm_ranks = ranks;
+        match generate_typed::<DependencyProposal>(model, req).await {
+            Ok(prop) => {
+                let (_, _, ranks) = graph.apply_dependency_proposal(&prop);
+                llm_ranks = ranks;
+            }
+            Err(err) if err.is_fatal_config_or_auth() => {
+                return Err(PlanBuildError::FatalLlm(err));
+            }
+            Err(err) => {
+                if !cfg.quiet {
+                    eprintln!(
+                        "[git-untangle] warning: LLM dependency inference failed ({err}); using syntactic dependencies"
+                    );
+                }
+            }
         }
     }
 
-    let order = graph.topological_order(cfg.mechanical_placement, &llm_ranks, items)?;
+    let order = graph
+        .topological_order(cfg.mechanical_placement, &llm_ranks, items)
+        .map_err(PlanBuildError::Core)?;
     Ok((graph, order, llm_ranks))
 }
 
@@ -770,23 +885,154 @@ async fn verify_graph_in_worktree(
     }
 }
 
-async fn author_commit_messages(
-    order: &[Operation],
+fn extract_batch_messages(
+    expected_op_ids: &[String],
+    mut prop: CommitMessageProposal,
+) -> IndexMap<String, CommitMessageDraft> {
+    let expected_set: BTreeSet<&str> = expected_op_ids.iter().map(String::as_str).collect();
+    let mut matched = IndexMap::new();
+
+    for (raw_id, draft) in prop.messages.drain(..) {
+        let norm = normalize_entity_id(&raw_id);
+        if expected_set.contains(norm.as_str()) {
+            matched
+                .entry(norm)
+                .and_modify(|existing: &mut CommitMessageDraft| existing.merge_from(draft.clone()))
+                .or_insert(draft);
+        } else {
+            // Reinsert unmatched in case single-op fallback remap applies below
+            matched.insert(norm, draft);
+        }
+    }
+
+    let any_expected = expected_op_ids
+        .iter()
+        .any(|id| matched.contains_key(id.as_str()));
+    if !any_expected && expected_op_ids.len() == 1 && matched.len() == 1 {
+        let (_, single_draft) = matched.into_iter().next().expect("len == 1");
+        let mut remapped = IndexMap::new();
+        remapped.insert(expected_op_ids[0].clone(), single_draft);
+        return remapped;
+    }
+
+    matched.retain(|k, _| expected_set.contains(k.as_str()));
+    matched
+}
+
+async fn run_single_commit_message_batch(
+    batch: CommitMessageBatch,
     commit_context: &str,
     items: &IndexMap<String, ChangeItem>,
     model: &dyn SemanticModel,
-) -> IndexMap<String, CommitMessageDraft> {
-    let mut drafted = IndexMap::new();
-    let batches = batch_operations(order, items, DEFAULT_BATCH_CHAR_BUDGET);
-    for batch in batches {
-        let req = build_commit_messages_request(&batch, commit_context, items);
-        if let Ok(prop) = generate_typed::<CommitMessageProposal>(model, req).await {
-            for (op_id, draft) in prop.messages {
-                drafted.insert(op_id.trim().to_owned(), draft);
+) -> Result<IndexMap<String, CommitMessageDraft>, LlmError> {
+    let expected = batch.expected_op_ids();
+    let req = build_commit_message_batch_request(&batch, commit_context, items);
+    let prop = generate_typed::<CommitMessageProposal>(model, req.clone()).await?;
+    let matched = extract_batch_messages(&expected, prop);
+    if !matched.is_empty() || expected.is_empty() {
+        return Ok(matched);
+    }
+
+    // 1-shot key-alignment repair if the model returned valid JSON without matching operation IDs
+    let mut repair_req = req;
+    repair_req.user_prompt.push_str(&format!(
+        "\n\nYour previous reply did not contain entries keyed by the required operation ID(s): {}. Return ONLY JSON with `messages` keyed by those exact operation IDs.",
+        expected.join(", ")
+    ));
+    match generate_typed::<CommitMessageProposal>(model, repair_req).await {
+        Ok(repaired) => Ok(extract_batch_messages(&expected, repaired)),
+        Err(LlmError::CassetteMiss { .. }) => Ok(IndexMap::new()),
+        Err(e) => Err(e),
+    }
+}
+
+async fn author_commit_messages(
+    batches: &[CommitMessageBatch],
+    commit_context: &str,
+    items: &IndexMap<String, ChangeItem>,
+    model: Arc<dyn SemanticModel>,
+    quiet: bool,
+) -> Result<IndexMap<String, CommitMessageDraft>, LlmError> {
+    let mut drafted: IndexMap<String, CommitMessageDraft> = IndexMap::new();
+    if batches.is_empty() {
+        return Ok(drafted);
+    }
+
+    if batches.len() == 1 {
+        match run_single_commit_message_batch(
+            batches[0].clone(),
+            commit_context,
+            items,
+            model.as_ref(),
+        )
+        .await
+        {
+            Ok(batch_map) => {
+                for (op_id, draft) in batch_map {
+                    drafted
+                        .entry(op_id)
+                        .and_modify(|existing| existing.merge_from(draft.clone()))
+                        .or_insert(draft);
+                }
+            }
+            Err(err) if err.is_fatal_config_or_auth() => return Err(err),
+            Err(err) => {
+                if !quiet {
+                    eprintln!(
+                        "[git-untangle] warning: LLM commit message generation failed ({err})"
+                    );
+                }
+            }
+        }
+        return Ok(drafted);
+    }
+
+    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_COMMIT_MSG_BATCHES));
+    let shared_items = Arc::new(items.clone());
+    let shared_ctx = Arc::new(commit_context.to_owned());
+    let mut handles = Vec::with_capacity(batches.len());
+
+    for (idx, batch) in batches.iter().cloned().enumerate() {
+        let permit = Arc::clone(&sem)
+            .acquire_owned()
+            .await
+            .expect("semaphore open");
+        let m = Arc::clone(&model);
+        let it = Arc::clone(&shared_items);
+        let ctx = Arc::clone(&shared_ctx);
+        handles.push(tokio::spawn(async move {
+            let _permit = permit;
+            let res = run_single_commit_message_batch(batch, &ctx, &it, m.as_ref()).await;
+            (idx, res)
+        }));
+    }
+
+    for handle in handles {
+        let Ok((idx, res)) = handle.await else {
+            continue;
+        };
+        match res {
+            Ok(batch_map) => {
+                for (op_id, draft) in batch_map {
+                    drafted
+                        .entry(op_id)
+                        .and_modify(|existing| existing.merge_from(draft.clone()))
+                        .or_insert(draft);
+                }
+            }
+            Err(err) if err.is_fatal_config_or_auth() => return Err(err),
+            Err(err) => {
+                if !quiet {
+                    eprintln!(
+                        "[git-untangle] warning: LLM commit message batch {} failed ({err})",
+                        idx + 1
+                    );
+                }
             }
         }
     }
-    drafted
+
+    Ok(drafted)
 }
 
 fn write_stdout(s: &str) -> std::io::Result<()> {

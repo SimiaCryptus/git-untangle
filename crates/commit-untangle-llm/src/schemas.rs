@@ -122,6 +122,10 @@ pub fn commit_messages_schema() -> Value {
                         "item_subjects": {
                             "type": "object",
                             "additionalProperties": { "type": "string" }
+                        },
+                        "item_bodies": {
+                            "type": "object",
+                            "additionalProperties": { "type": "string" }
                         }
                     },
                     "required": ["subject", "body"]

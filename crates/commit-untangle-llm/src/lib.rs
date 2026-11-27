@@ -43,6 +43,46 @@ pub enum LlmError {
     Io(#[from] std::io::Error),
 }
 
+impl LlmError {
+    /// Returns `true` when the error indicates a permanent configuration, credential, or model-name
+    /// error that will fail identically on subsequent calls and should not be silently ignored.
+    pub fn is_fatal_config_or_auth(&self) -> bool {
+        match self {
+            Self::UnconfiguredProvider(_) | Self::MissingApiKey(_) => true,
+            Self::ProviderResponse { status, body } => {
+                if matches!(status, 401 | 403 | 404) {
+                    return true;
+                }
+                if *status == 400 {
+                    let lower = body.to_ascii_lowercase();
+                    return lower.contains("not_found")
+                        || lower.contains("model_not_found")
+                        || lower.contains("does not exist")
+                        || lower.contains("invalid_api_key")
+                        || lower.contains("authentication_error")
+                        || lower.contains("permission_error")
+                        || (lower.contains("model") && lower.contains("invalid"));
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Optional actionable hint appended to CLI diagnostics for common provider errors.
+    pub fn diagnostic_hint(&self) -> Option<&'static str> {
+        match self {
+            Self::ProviderResponse { status: 404, .. } => Some(
+                "verify the model ID in `--model <provider::id>` (e.g. `anthropic::claude-haiku-4-5`, `anthropic::claude-sonnet-4-5`, `gemini::gemini-2.5-pro`, `openai::gpt-4.1`)",
+            ),
+            Self::ProviderResponse {
+                status: 401 | 403, ..
+            } => Some("check your provider API key environment variable and account permissions"),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticTask {
@@ -126,13 +166,27 @@ pub trait SemanticModel: Send + Sync {
     ) -> Result<serde_json::Value, LlmError>;
 }
 
-/// Typed convenience wrapper decoding structured JSON at the algorithm boundary.
+/// Typed convenience wrapper decoding structured JSON at the algorithm boundary,
+/// with a 1-shot schema-validation repair retry when deserialization into `T` fails.
 pub async fn generate_typed<T: DeserializeOwned>(
     model: &dyn SemanticModel,
     request: StructuredRequest,
 ) -> Result<T, LlmError> {
-    let val = model.generate_json(request).await?;
-    Ok(serde_json::from_value(val)?)
+    let val = model.generate_json(request.clone()).await?;
+    match serde_json::from_value::<T>(val) {
+        Ok(parsed) => Ok(parsed),
+        Err(first_err) => {
+            let mut repair_req = request;
+            repair_req.user_prompt.push_str(&format!(
+                "\n\nYour previous JSON response failed schema validation ({first_err}). Return ONLY a valid JSON object strictly conforming to the schema."
+            ));
+            match model.generate_json(repair_req).await {
+                Ok(repaired_val) => Ok(serde_json::from_value(repaired_val)?),
+                Err(LlmError::CassetteMiss { .. }) => Err(LlmError::Json(first_err)),
+                Err(other_err) => Err(other_err),
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

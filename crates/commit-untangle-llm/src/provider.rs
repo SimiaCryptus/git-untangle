@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -82,6 +83,21 @@ pub struct ProviderModel {
     api_key: Option<String>,
     base_url: String,
     max_repair_retries: usize,
+    omit_temperature: AtomicBool,
+}
+
+fn is_temperature_unsupported_error(status: u16, body: &str) -> bool {
+    if status != 400 {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    lower.contains("temperature")
+        && (lower.contains("deprecated")
+            || lower.contains("unsupported")
+            || lower.contains("not supported")
+            || lower.contains("does not support")
+            || lower.contains("not allowed")
+            || lower.contains("invalid"))
 }
 
 impl ProviderModel {
@@ -160,22 +176,70 @@ impl ProviderModel {
             api_key,
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             max_repair_retries: 1,
+            omit_temperature: AtomicBool::new(false),
         })
     }
 
-    async fn call_raw(
+    async fn call_raw_with_backoff(
         &self,
         system: &str,
         user: &str,
         temperature: f32,
-    ) -> Result<String, LlmError> {
+    ) -> Result<(String, bool), LlmError> {
+        let mut attempt = 0usize;
+        let max_http_retries = 2usize;
+        loop {
+            let res = self.call_raw_once(system, user, temperature).await;
+            if let Err(LlmError::ProviderResponse { status, ref body }) = res {
+                if !self.omit_temperature.load(Ordering::Relaxed)
+                    && is_temperature_unsupported_error(status, body)
+                {
+                    debug!("model rejected `temperature`; retrying without temperature");
+                    self.omit_temperature.store(true, Ordering::Relaxed);
+                    continue;
+                }
+            }
+            let should_retry = match &res {
+                Err(LlmError::ProviderResponse { status, .. }) => {
+                    matches!(status, 429 | 500 | 502 | 503 | 504 | 529)
+                }
+                _ => false,
+            };
+            if should_retry && attempt < max_http_retries {
+                let delay_ms = 400u64 * (1u64 << attempt);
+                debug!(
+                    "transient provider error on attempt {}, backing off {}ms",
+                    attempt + 1,
+                    delay_ms
+                );
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                attempt += 1;
+                continue;
+            }
+            return res;
+        }
+    }
+
+    async fn call_raw_once(
+        &self,
+        system: &str,
+        user: &str,
+        temperature: f32,
+    ) -> Result<(String, bool), LlmError> {
         match self.spec.provider {
             ProviderKind::Anthropic => self.call_anthropic(system, user, temperature).await,
-            ProviderKind::Gemini => self.call_gemini(system, user, temperature).await,
-            ProviderKind::OpenAi | ProviderKind::OpenRouter => {
-                self.call_openai(system, user, temperature).await
-            }
-            ProviderKind::Ollama => self.call_ollama(system, user, temperature).await,
+            ProviderKind::Gemini => self
+                .call_gemini(system, user, temperature)
+                .await
+                .map(|s| (s, false)),
+            ProviderKind::OpenAi | ProviderKind::OpenRouter => self
+                .call_openai(system, user, temperature)
+                .await
+                .map(|s| (s, false)),
+            ProviderKind::Ollama => self
+                .call_ollama(system, user, temperature)
+                .await
+                .map(|s| (s, false)),
         }
     }
 
@@ -184,18 +248,20 @@ impl ProviderModel {
         system: &str,
         user: &str,
         temperature: f32,
-    ) -> Result<String, LlmError> {
+    ) -> Result<(String, bool), LlmError> {
         let url = format!("{}/v1/messages", self.base_url);
         let key = self.api_key.as_deref().unwrap_or("");
-        let body = json!({
+        let mut body = json!({
             "model": self.spec.model,
-            "max_tokens": 4096,
-            "temperature": temperature,
+            "max_tokens": 8192,
             "system": system,
             "messages": [
                 { "role": "user", "content": user }
             ]
         });
+        if !self.omit_temperature.load(Ordering::Relaxed) {
+            body["temperature"] = json!(temperature);
+        }
 
         let resp = self
             .client
@@ -219,6 +285,7 @@ impl ProviderModel {
             });
         }
 
+        let truncated = val.get("stop_reason").and_then(Value::as_str) == Some("max_tokens");
         let mut text = String::new();
         if let Some(arr) = val.get("content").and_then(Value::as_array) {
             for block in arr {
@@ -234,7 +301,7 @@ impl ProviderModel {
                 "Anthropic response contained no text blocks".to_owned(),
             ));
         }
-        Ok(text)
+        Ok((text, truncated))
     }
 
     async fn call_gemini(
@@ -301,15 +368,17 @@ impl ProviderModel {
     ) -> Result<String, LlmError> {
         let url = format!("{}/v1/chat/completions", self.base_url);
         let key = self.api_key.as_deref().unwrap_or("");
-        let body = json!({
+        let mut body = json!({
             "model": self.spec.model,
-            "temperature": temperature,
             "response_format": { "type": "json_object" },
             "messages": [
                 { "role": "system", "content": system },
                 { "role": "user", "content": user }
             ]
         });
+        if !self.omit_temperature.load(Ordering::Relaxed) {
+            body["temperature"] = json!(temperature);
+        }
 
         let resp = self
             .client
@@ -437,7 +506,9 @@ impl SemanticModel for ProviderModel {
         let mut last_err = String::new();
 
         for attempt in 0..=self.max_repair_retries {
-            let raw = self.call_raw(&system, &prompt, request.temperature).await?;
+            let (raw, truncated) = self
+                .call_raw_with_backoff(&system, &prompt, request.temperature)
+                .await?;
             match extract_json_value(&raw) {
                 Ok(val) => return Ok(val),
                 Err(err) => {
@@ -446,11 +517,20 @@ impl SemanticModel for ProviderModel {
                         attempt + 1,
                         err
                     );
-                    last_err = err;
+                    last_err = if truncated {
+                        format!("{err} (response truncated at max_tokens)")
+                    } else {
+                        err
+                    };
                     if attempt < self.max_repair_retries {
+                        let conciseness_note = if truncated {
+                            " Keep string values concise so the complete JSON object fits within max_tokens."
+                        } else {
+                            ""
+                        };
                         prompt = format!(
-                            "{}\n\nYour previous reply was not valid JSON ({}). Return ONLY a valid JSON object matching the schema with no prose.",
-                            request.user_prompt, last_err
+                            "{}\n\nYour previous reply was not valid JSON ({}). Return ONLY a valid JSON object matching the schema with no prose.{}",
+                            request.user_prompt, last_err, conciseness_note
                         );
                     }
                 }
@@ -490,13 +570,15 @@ impl ProviderModel {
             })
             .collect();
 
-        let body = json!({
+        let mut body = json!({
             "model": self.spec.model,
-            "max_tokens": 4096,
-            "temperature": temperature,
+            "max_tokens": 8192,
             "system": system,
             "messages": turns,
         });
+        if !self.omit_temperature.load(Ordering::Relaxed) {
+            body["temperature"] = json!(temperature);
+        }
 
         let resp = self
             .client
@@ -630,11 +712,13 @@ impl ProviderModel {
             })
             .collect();
 
-        let body = json!({
+        let mut body = json!({
             "model": self.spec.model,
-            "temperature": temperature,
             "messages": turns,
         });
+        if !self.omit_temperature.load(Ordering::Relaxed) {
+            body["temperature"] = json!(temperature);
+        }
 
         let resp = self
             .client
@@ -726,23 +810,35 @@ impl ProviderModel {
 #[async_trait]
 impl ChatModel for ProviderModel {
     async fn chat(&self, request: ChatRequest) -> Result<String, LlmError> {
-        match self.spec.provider {
-            ProviderKind::Anthropic => {
-                self.chat_anthropic(&request.messages, request.temperature)
-                    .await
+        loop {
+            let res = match self.spec.provider {
+                ProviderKind::Anthropic => {
+                    self.chat_anthropic(&request.messages, request.temperature)
+                        .await
+                }
+                ProviderKind::Gemini => {
+                    self.chat_gemini(&request.messages, request.temperature)
+                        .await
+                }
+                ProviderKind::OpenAi | ProviderKind::OpenRouter => {
+                    self.chat_openai(&request.messages, request.temperature)
+                        .await
+                }
+                ProviderKind::Ollama => {
+                    self.chat_ollama(&request.messages, request.temperature)
+                        .await
+                }
+            };
+            if let Err(LlmError::ProviderResponse { status, ref body }) = res {
+                if !self.omit_temperature.load(Ordering::Relaxed)
+                    && is_temperature_unsupported_error(status, body)
+                {
+                    debug!("chat model rejected `temperature`; retrying without temperature");
+                    self.omit_temperature.store(true, Ordering::Relaxed);
+                    continue;
+                }
             }
-            ProviderKind::Gemini => {
-                self.chat_gemini(&request.messages, request.temperature)
-                    .await
-            }
-            ProviderKind::OpenAi | ProviderKind::OpenRouter => {
-                self.chat_openai(&request.messages, request.temperature)
-                    .await
-            }
-            ProviderKind::Ollama => {
-                self.chat_ollama(&request.messages, request.temperature)
-                    .await
-            }
+            return res;
         }
     }
 }

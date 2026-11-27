@@ -334,7 +334,10 @@
       html += `<h3>Change Items (${op.items.length})</h3>`;
       op.items.forEach(it => {
         const loc = it.line_start ? `:${it.line_start}` : "";
-        html += `<div><strong>${escapeHtml(it.id)}</strong> · <code>${escapeHtml(it.kind)}</code> · <code>${escapeHtml(it.file)}${loc}</code> ${it.commit ? `· <code>${escapeHtml(it.commit.slice(0, 10))}</code>` : ""}</div>`;
+        html += `<div><strong>${escapeHtml(it.id)}</strong> · <code>${escapeHtml(it.kind)}</code> · <code>${escapeHtml(it.file)}${loc}</code> ${it.commit ? `· <code>${escapeHtml(it.commit.slice(0, 10))}</code>` : ""}${it.commit_subject ? ` — <span>${escapeHtml(it.commit_subject)}</span>` : ""}</div>`;
+        if (it.commit_body && op.items.length > 1) {
+          html += `<div style="font-size:12px;color:var(--muted);margin:4px 0 6px;">${escapeHtml(it.commit_body)}</div>`;
+        }
         if (it.diff_preview) {
           html += `<pre class="diff">${formatDiffHtml(it.diff_preview)}</pre>`;
         }

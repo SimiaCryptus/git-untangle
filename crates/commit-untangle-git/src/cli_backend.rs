@@ -7,7 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use commit_untangle_core::bytes::RawBytes;
 use commit_untangle_core::graph::ChangeGraph;
-use commit_untangle_core::model::{ChangeItem, FileChange, FileMode, Operation, RawFileDelta};
+use commit_untangle_core::model::{
+    ChangeItem, FileChange, FileMode, ItemKind, Operation, RawFileDelta,
+};
 use commit_untangle_core::proposal::CommitMessageDraft;
 use commit_untangle_core::replay::desired_path_states;
 use commit_untangle_core::schema::CommitSummary;
@@ -589,12 +591,23 @@ impl GitCliBackend {
         let mut result = DagEmitResult::default();
         result.metadata.operation_parents = reduced_parents.clone();
 
-        // Populate inline previews for every item so `--dry-run` still produces rich viewer diffs.
+        // Populate inline previews and resolved commit messages for every item so `--dry-run`
+        // also surfaces rich viewer/report descriptions and diffs.
         for item in items_by_id.values() {
             result.metadata.item_diff_previews.insert(
                 item.id.clone(),
                 build_inline_item_preview(item, &files[item.file_index]),
             );
+        }
+        for op in order {
+            let draft = options.commit_messages.get(&op.id);
+            for item_id in &op.item_ids {
+                if let Some(item) = items_by_id.get(item_id) {
+                    let (subj, body) = resolve_item_commit_text(op, item, draft);
+                    result.metadata.item_subjects.insert(item.id.clone(), subj);
+                    result.metadata.item_bodies.insert(item.id.clone(), body);
+                }
+            }
         }
 
         if options.dry_run {
@@ -862,7 +875,12 @@ impl GitCliBackend {
                     let all_items: BTreeSet<String> = items_by_id.keys().cloned().collect();
                     reset_index_to(&parent_shas[0], &mut current_index_commit)?;
                     stage_desired(&all_file_refs, &all_items, &mut blob_oid_cache)?;
-                    let msg = format_final_merge_message(&sinks, &target.short_id, &target.subject);
+                    let msg = format_final_merge_message(
+                        &sinks,
+                        order,
+                        &target.short_id,
+                        &target.subject,
+                    );
                     let merge_sha =
                         commit_current_index(&parent_shas, &msg, &mut current_index_commit)?;
                     result.metadata.merge_commits.push(merge_sha.clone());
@@ -1028,7 +1046,12 @@ fn format_merge_message(
     out
 }
 
-fn format_final_merge_message(sinks: &[String], short_sha: &str, subject: &str) -> String {
+fn format_final_merge_message(
+    sinks: &[String],
+    order: &[Operation],
+    short_sha: &str,
+    subject: &str,
+) -> String {
     let mut out = String::new();
     let header = format!("Merge exploded commit {short_sha}: {subject}");
     out.push_str(&first_line_clipped(&header, 100));
@@ -1038,35 +1061,63 @@ fn format_final_merge_message(sinks: &[String], short_sha: &str, subject: &str) 
         sinks.join(", ")
     ));
     out.push_str("the resulting tree is identical to the original commit.\n\n");
+    if !order.is_empty() {
+        out.push_str("Operations:\n");
+        for op in order.iter().take(30) {
+            out.push_str(&format!(
+                "- {} [{}]: {}\n",
+                op.id,
+                op.category,
+                first_line_clipped(&op.name, 80)
+            ));
+        }
+        if order.len() > 30 {
+            out.push_str(&format!(
+                "- ...and {} more operation(s)\n",
+                order.len() - 30
+            ));
+        }
+        out.push('\n');
+    }
     out.push_str(&format!("Commit-Analyzer-Source: {short_sha}\n"));
     out
 }
 
-fn format_item_message(
+fn human_item_action(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::AddFile => "add",
+        ItemKind::DeleteFile => "remove",
+        ItemKind::ReplaceFile => "replace",
+        ItemKind::Move => "move",
+        ItemKind::ModeChange => "chmod",
+        ItemKind::Whitespace => "format",
+        ItemKind::Reorder => "reorder",
+        ItemKind::BulkReplace => "update",
+        ItemKind::Edit => "update",
+    }
+}
+
+fn resolve_item_commit_text(
     op: &Operation,
     item: &ChangeItem,
-    step: usize,
-    total: usize,
-    short_sha: &str,
     draft: Option<&CommitMessageDraft>,
-) -> String {
-    let mut out = String::new();
-    let header = if let Some(d) = draft {
+) -> (String, String) {
+    let raw_header = if let Some(d) = draft {
         if let Some(item_subj) = d
             .item_subjects
             .get(&item.id)
-            .map(|s| s.trim())
+            .map(|s| s.trim().trim_end_matches('.'))
             .filter(|s| !s.is_empty())
         {
             item_subj.to_owned()
         } else if !d.subject.trim().is_empty() {
+            let op_subj = d.subject.trim().trim_end_matches('.');
             if op.item_ids.len() == 1 {
-                d.subject.trim().to_owned()
+                op_subj.to_owned()
             } else {
                 format!(
-                    "{}: {} {}",
-                    d.subject.trim(),
-                    item.kind.as_str().to_lowercase(),
+                    "{op_subj}: {} {}",
+                    human_item_action(item.kind),
                     item.display_path
                 )
             }
@@ -1086,14 +1137,49 @@ fn format_item_message(
             item.display_path
         )
     };
-    let body = draft
-        .map(|d| d.body.trim())
-        .filter(|b| !b.is_empty())
-        .unwrap_or_else(|| op.description.trim());
+    let subject = first_line_clipped(&raw_header, 100);
 
-    out.push_str(&first_line_clipped(&header, 100));
+    let item_body = draft
+        .and_then(|d| d.item_bodies.get(&item.id))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let op_body = draft.map(|d| d.body.trim()).filter(|s| !s.is_empty());
+
+    let body = if op.item_ids.len() <= 1 {
+        match (item_body, op_body) {
+            (Some(ib), Some(ob)) if ib != ob && !ob.contains(ib) => format!("{ib}\n\n{ob}"),
+            (_, Some(ob)) => ob.to_owned(),
+            (Some(ib), None) => ib.to_owned(),
+            (None, None) => op.description.trim().to_owned(),
+        }
+    } else {
+        match (item_body, op_body) {
+            (Some(ib), Some(ob)) if ib != ob && !ib.contains(ob) => {
+                format!("{ib}\n\nOperation context: {ob}")
+            }
+            (Some(ib), _) => ib.to_owned(),
+            (None, Some(ob)) => ob.to_owned(),
+            (None, None) => op.description.trim().to_owned(),
+        }
+    };
+
+    (subject, body)
+}
+
+fn format_item_message(
+    op: &Operation,
+    item: &ChangeItem,
+    step: usize,
+    total: usize,
+    short_sha: &str,
+    draft: Option<&CommitMessageDraft>,
+) -> String {
+    let mut out = String::new();
+    let (subject, body) = resolve_item_commit_text(op, item, draft);
+
+    out.push_str(&subject);
     out.push_str("\n\n");
-    out.push_str(body);
+    out.push_str(&body);
     out.push('\n');
     if let Some(ref rule) = op.rule {
         let r: String = rule.chars().take(500).collect();

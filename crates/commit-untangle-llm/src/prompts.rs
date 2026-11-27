@@ -11,6 +11,7 @@ use crate::{SemanticTask, StructuredRequest};
 pub const PROMPT_VERSION: &str = "v1";
 pub const DEFAULT_BATCH_CHAR_BUDGET: usize = 20_000;
 pub const MAX_SUMMARIZED_ITEMS_PER_CLUSTER: usize = 40;
+pub const MAX_ITEMS_PER_COMMIT_MSG_BATCH: usize = 12;
 
 fn clip_line(s: &str, max_chars: usize) -> String {
     s.trim_end().chars().take(max_chars).collect()
@@ -67,6 +68,37 @@ pub fn item_summary(item: &ChangeItem, max_lines: usize) -> String {
             .collect();
         if !defs.is_empty() {
             out.push_str(&format!("    defines: {}\n", defs.join(", ")));
+        }
+        match item.kind {
+            ItemKind::AddFile | ItemKind::ReplaceFile => {
+                let disp = item.added_bytes.to_display();
+                let non_empty: Vec<&str> = disp
+                    .lines()
+                    .map(str::trim_end)
+                    .filter(|l| !l.trim().is_empty())
+                    .collect();
+                for line in non_empty.iter().take(max_lines) {
+                    out.push_str(&format!("    + {}\n", clip_line(line, 140)));
+                }
+                if non_empty.len() > max_lines {
+                    out.push_str("    + ...\n");
+                }
+            }
+            ItemKind::DeleteFile => {
+                let disp = item.removed_bytes.to_display();
+                let non_empty: Vec<&str> = disp
+                    .lines()
+                    .map(str::trim_end)
+                    .filter(|l| !l.trim().is_empty())
+                    .collect();
+                for line in non_empty.iter().take(max_lines) {
+                    out.push_str(&format!("    - {}\n", clip_line(line, 140)));
+                }
+                if non_empty.len() > max_lines {
+                    out.push_str("    - ...\n");
+                }
+            }
+            _ => {}
         }
     }
     out
@@ -280,7 +312,34 @@ Return ONLY valid JSON conforming to the schema with `required_operation_ids` an
     }
 }
 
-/// Packs operations into prompt-sized batches up to `char_budget` for commit-message authoring.
+/// Unit of work for LLM commit-message authoring.
+///
+/// Small/medium operations (`<= MAX_ITEMS_PER_COMMIT_MSG_BATCH` items) are packed together via
+/// [`CommitMessageBatch::Operations`], while large operations (`> MAX_ITEMS_PER_COMMIT_MSG_BATCH`
+/// items) are sliced into bounded item chunks via [`CommitMessageBatch::OperationSlice`] so every
+/// single item receives an authored commit subject and description without hitting output limits.
+#[derive(Debug, Clone)]
+pub enum CommitMessageBatch {
+    Operations(Vec<Operation>),
+    OperationSlice {
+        op: Operation,
+        slice_item_ids: Vec<String>,
+        slice_index: usize,
+        total_slices: usize,
+    },
+}
+
+impl CommitMessageBatch {
+    pub fn expected_op_ids(&self) -> Vec<String> {
+        match self {
+            Self::Operations(ops) => ops.iter().map(|o| o.id.clone()).collect(),
+            Self::OperationSlice { op, .. } => vec![op.id.clone()],
+        }
+    }
+}
+
+/// Packs operations into prompt-sized batches up to `char_budget` and `MAX_ITEMS_PER_COMMIT_MSG_BATCH`
+/// for commit-message authoring.
 pub fn batch_operations(
     ops: &[Operation],
     items_by_id: &IndexMap<String, ChangeItem>,
@@ -289,24 +348,31 @@ pub fn batch_operations(
     let mut batches = Vec::new();
     let mut current: Vec<Operation> = Vec::new();
     let mut current_chars = 0usize;
+    let mut current_items = 0usize;
 
     for op in ops {
+        let op_items = op.item_ids.len().max(1);
         let op_chars: usize = op.name.len()
             + op.description.len()
             + op.item_ids
                 .iter()
                 .take(MAX_SUMMARIZED_ITEMS_PER_CLUSTER)
                 .filter_map(|id| items_by_id.get(id))
-                .map(|it| item_summary(it, 3).len())
+                .map(|it| item_summary(it, 4).len())
                 .sum::<usize>();
 
-        if !current.is_empty() && current_chars + op_chars > char_budget {
+        if !current.is_empty()
+            && (current_chars + op_chars > char_budget
+                || current_items + op_items > MAX_ITEMS_PER_COMMIT_MSG_BATCH)
+        {
             batches.push(current);
             current = Vec::new();
             current_chars = 0;
+            current_items = 0;
         }
         current.push(op.clone());
         current_chars += op_chars;
+        current_items += op_items;
     }
 
     if !current.is_empty() {
@@ -315,8 +381,74 @@ pub fn batch_operations(
     batches
 }
 
+/// Plans commit-message batches across operations, automatically slicing oversized operations
+/// (`> MAX_ITEMS_PER_COMMIT_MSG_BATCH` items) into bounded item chunks so every item is covered.
+pub fn plan_commit_message_batches(
+    ops: &[Operation],
+    items_by_id: &IndexMap<String, ChangeItem>,
+    char_budget: usize,
+) -> Vec<CommitMessageBatch> {
+    let mut planned = Vec::new();
+    let mut pending_small: Vec<Operation> = Vec::new();
+
+    let flush_small = |small: &mut Vec<Operation>, out: &mut Vec<CommitMessageBatch>| {
+        if !small.is_empty() {
+            for group in batch_operations(small, items_by_id, char_budget) {
+                out.push(CommitMessageBatch::Operations(group));
+            }
+            small.clear();
+        }
+    };
+
+    for op in ops {
+        if op.item_ids.len() > MAX_ITEMS_PER_COMMIT_MSG_BATCH {
+            flush_small(&mut pending_small, &mut planned);
+            let chunks: Vec<&[String]> =
+                op.item_ids.chunks(MAX_ITEMS_PER_COMMIT_MSG_BATCH).collect();
+            let total_slices = chunks.len();
+            for (slice_index, chunk) in chunks.into_iter().enumerate() {
+                planned.push(CommitMessageBatch::OperationSlice {
+                    op: op.clone(),
+                    slice_item_ids: chunk.to_vec(),
+                    slice_index,
+                    total_slices,
+                });
+            }
+        } else {
+            pending_small.push(op.clone());
+        }
+    }
+    flush_small(&mut pending_small, &mut planned);
+    planned
+}
+
+pub fn build_commit_message_batch_request(
+    batch: &CommitMessageBatch,
+    commit_context: &str,
+    items_by_id: &IndexMap<String, ChangeItem>,
+) -> StructuredRequest {
+    match batch {
+        CommitMessageBatch::Operations(ops) => {
+            build_commit_messages_request(ops, commit_context, items_by_id)
+        }
+        CommitMessageBatch::OperationSlice {
+            op,
+            slice_item_ids,
+            slice_index,
+            total_slices,
+        } => build_operation_slice_request(
+            op,
+            slice_item_ids,
+            *slice_index,
+            *total_slices,
+            commit_context,
+            items_by_id,
+        ),
+    }
+}
+
 /// Builds a structured request asking the LLM to author crisp, idiomatic Git commit messages
-/// (imperative subject <= 72 chars, concise explanatory body, and optional per-item subjects)
+/// (imperative subject <= 72 chars, concise explanatory body, and per-item subjects + bodies)
 /// for a batch of operations.
 pub fn build_commit_messages_request(
     ops: &[Operation],
@@ -325,11 +457,12 @@ pub fn build_commit_messages_request(
 ) -> StructuredRequest {
     let system_prompt = "\
 You write clear, idiomatic Git commit messages for decomposed atomic operations.
-For each operation id (e.g. `op1`), produce:
-- `subject`: concise imperative commit subject (<= 72 characters, no trailing period)
-- `body`: 1-3 concise sentences explaining why and what changed (wrap cleanly; omit git trailers as those are added automatically)
-- `item_subjects` (optional): map from item id (e.g. `i3`) to a short imperative subject (<= 72 chars) when an operation spans multiple items.
-Return ONLY valid JSON conforming to the schema with a top-level `messages` map keyed by operation id."
+For EVERY operation id listed below (using exact keys such as `op1`), produce an entry in `messages`:
+- `subject`: concise imperative commit subject (<= 72 characters, no trailing period; match repo style such as `feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:` when appropriate). Never use generic counts like \"Add 32 files\".
+- `body`: 1-3 substantive sentences explaining what changed and why (omit git trailers; never write boilerplate like \"Changes N change item(s)\").
+- `item_subjects`: when an operation has more than 1 item, include an imperative commit subject (<= 72 chars) for EVERY item id (e.g. `i3`) in that operation.
+- `item_bodies`: when an operation has more than 1 item, include a concise 1-2 sentence commit description for EVERY item id explaining that specific file or hunk change.
+Return ONLY valid JSON conforming to the schema with a top-level `messages` map keyed by exact operation id."
         .to_owned();
 
     let mut user = String::new();
@@ -341,16 +474,22 @@ Return ONLY valid JSON conforming to the schema with a top-level `messages` map 
 
     user.push_str("## Operations\n");
     for op in ops {
-        user.push_str(&format!("### {} [{}] {}\n", op.id, op.category, op.name));
+        user.push_str(&format!(
+            "### {} [{}] ({} item(s)): {}\n",
+            op.id,
+            op.category,
+            op.item_ids.len(),
+            op.name
+        ));
         if !op.description.trim().is_empty() {
-            user.push_str(&format!("Current description: {}\n", op.description.trim()));
+            user.push_str(&format!("Current summary: {}\n", op.description.trim()));
         }
         if let Some(ref rule) = op.rule {
             user.push_str(&format!("Mechanical rule: {rule}\n"));
         }
         for item_id in op.item_ids.iter().take(MAX_SUMMARIZED_ITEMS_PER_CLUSTER) {
             if let Some(item) = items_by_id.get(item_id) {
-                user.push_str(&item_summary(item, 3));
+                user.push_str(&item_summary(item, 4));
             }
         }
         if op.item_ids.len() > MAX_SUMMARIZED_ITEMS_PER_CLUSTER {
@@ -361,7 +500,89 @@ Return ONLY valid JSON conforming to the schema with a top-level `messages` map 
         }
         user.push('\n');
     }
-    user.push_str("Respond with JSON containing `messages`.");
+    let op_list: Vec<&str> = ops.iter().map(|o| o.id.as_str()).collect();
+    user.push_str(&format!(
+        "Respond with JSON containing `messages` keyed by: {}.",
+        op_list.join(", ")
+    ));
+
+    StructuredRequest {
+        task: SemanticTask::WriteCommitMessages,
+        prompt_version: PROMPT_VERSION.to_owned(),
+        system_prompt,
+        user_prompt: user,
+        json_schema: commit_messages_schema(),
+        temperature: 0.2,
+    }
+}
+
+/// Builds a structured request for a single slice of items within a large multi-item operation.
+pub fn build_operation_slice_request(
+    op: &Operation,
+    slice_item_ids: &[String],
+    slice_index: usize,
+    total_slices: usize,
+    commit_context: &str,
+    items_by_id: &IndexMap<String, ChangeItem>,
+) -> StructuredRequest {
+    let system_prompt = "\
+You write clear, idiomatic Git commit messages for decomposed atomic operations and their individual item commits.
+Produce a JSON object with `messages` containing exact key `".to_owned()
+        + &op.id
+        + "`:
+- `subject`: concise imperative commit subject (<= 72 characters, no trailing period) summarizing the overall operation (not generic file counts).
+- `body`: 1-3 substantive sentences explaining the overall operation's purpose and architecture.
+- `item_subjects`: REQUIRED map with an imperative commit subject (<= 72 characters) for EVERY item id listed in this batch (`i...`).
+- `item_bodies`: REQUIRED map with a concise 1-2 sentence commit description for EVERY item id listed in this batch explaining what that specific file/hunk introduces or updates.
+Return ONLY valid JSON conforming to the schema.";
+
+    let mut user = String::new();
+    if !commit_context.trim().is_empty() {
+        user.push_str("## Original Commit Context\n");
+        user.push_str(&commit_context.chars().take(2500).collect::<String>());
+        user.push_str("\n\n");
+    }
+
+    let all_files = op.files(items_by_id);
+    let file_preview: Vec<&str> = all_files.iter().take(20).map(String::as_str).collect();
+    let more_files = if all_files.len() > 20 {
+        format!(" (+{} more)", all_files.len() - 20)
+    } else {
+        String::new()
+    };
+
+    user.push_str(&format!(
+        "## Operation {} [{}] (slice {}/{} — {} of {} total item(s))\n",
+        op.id,
+        op.category,
+        slice_index + 1,
+        total_slices,
+        slice_item_ids.len(),
+        op.item_ids.len()
+    ));
+    user.push_str(&format!(
+        "Overall operation files: {}{more_files}\n",
+        file_preview.join(", ")
+    ));
+    if !op.description.trim().is_empty() {
+        user.push_str(&format!("Current summary: {}\n", op.description.trim()));
+    }
+    if let Some(ref rule) = op.rule {
+        user.push_str(&format!("Mechanical rule: {rule}\n"));
+    }
+    user.push_str(
+        "\n### Items in This Slice (provide `item_subjects` and `item_bodies` for ALL of these)\n",
+    );
+    for item_id in slice_item_ids {
+        if let Some(item) = items_by_id.get(item_id) {
+            user.push_str(&item_summary(item, 4));
+        }
+    }
+    user.push_str(&format!(
+        "\nRespond with JSON containing `messages.{}` including `subject`, `body`, `item_subjects`, and `item_bodies` for items: {}.",
+        op.id,
+        slice_item_ids.join(", ")
+    ));
 
     StructuredRequest {
         task: SemanticTask::WriteCommitMessages,

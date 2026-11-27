@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 
 use indexmap::IndexMap;
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::cluster::{
     default_description, default_name, deterministic_operation, normalize_category, truncate_chars,
@@ -9,36 +11,76 @@ use crate::cluster::{
 use crate::error::CoreError;
 use crate::model::{ChangeItem, Operation};
 
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// Normalizes LLM-emitted IDs such as `"[op1]"`, `` "`i12`" ``, `"op_1"`, or `" op1: "` into canonical IDs.
+pub fn normalize_entity_id(raw: &str) -> String {
+    let trimmed = raw
+        .trim()
+        .trim_matches(|c: char| matches!(c, '[' | ']' | '`' | '"' | '\'' | ':'))
+        .trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("operation ") {
+        return normalize_entity_id(rest);
+    }
+    if let Some(rest) = lower.strip_prefix("item ") {
+        return normalize_entity_id(rest);
+    }
+    if let Some(num) = lower.strip_prefix("op_") {
+        if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+            return format!("op{num}");
+        }
+    }
+    if let Some(num) = lower.strip_prefix("item_") {
+        if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+            return format!("i{num}");
+        }
+    }
+    trimmed.to_owned()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClusterAction {
     MergeClusters {
+        #[serde(default, deserialize_with = "null_to_default")]
         clusters: Vec<String>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "null_to_default")]
         reason: String,
     },
     SplitCluster {
+        #[serde(default, deserialize_with = "null_to_default")]
         cluster: String,
+        #[serde(default, deserialize_with = "null_to_default")]
         groups: Vec<Vec<String>>,
         #[serde(default)]
         reason: Option<String>,
     },
     MoveItems {
+        #[serde(default, deserialize_with = "null_to_default")]
         items: Vec<String>,
+        #[serde(default, deserialize_with = "null_to_default")]
         from_cluster: String,
+        #[serde(default, deserialize_with = "null_to_default")]
         to_cluster: String,
     },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OperationLabel {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub description: String,
     #[serde(default)]
     pub category: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub suspicious: bool,
     #[serde(default)]
     pub suspicion_reason: Option<String>,
@@ -47,37 +89,39 @@ pub struct OperationLabel {
 /// Constrained graph-patch proposal over deterministic clusters (`c1`, `c2`, ...).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClusterRefinementProposal {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub actions: Vec<ClusterAction>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub labels: IndexMap<String, OperationLabel>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PlannedEdge {
+    #[serde(default, deserialize_with = "null_to_default")]
     pub before: String,
+    #[serde(default, deserialize_with = "null_to_default")]
     pub after: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub reason: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DependencyProposal {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub edges: Vec<PlannedEdge>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub suggested_order: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BuildDiagnosisProposal {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub required_operation_ids: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub explanation: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct CommitMessageDraft {
     #[serde(default)]
     pub subject: String,
@@ -86,13 +130,250 @@ pub struct CommitMessageDraft {
     /// Optional per-item subject overrides keyed by `ChangeItem.id` (e.g. `i12`).
     #[serde(default)]
     pub item_subjects: IndexMap<String, String>,
+    /// Optional per-item body/description overrides keyed by `ChangeItem.id` (e.g. `i12`).
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub item_bodies: IndexMap<String, String>,
+}
+
+impl CommitMessageDraft {
+    pub fn merge_from(&mut self, other: CommitMessageDraft) {
+        if self.subject.trim().is_empty() && !other.subject.trim().is_empty() {
+            self.subject = other.subject.trim().to_owned();
+        }
+        if self.body.trim().is_empty() && !other.body.trim().is_empty() {
+            self.body = other.body.trim().to_owned();
+        }
+        for (k, v) in other.item_subjects {
+            let clean_k = normalize_entity_id(&k);
+            let clean_v = v.trim();
+            if !clean_k.is_empty() && !clean_v.is_empty() {
+                self.item_subjects.insert(clean_k, clean_v.to_owned());
+            }
+        }
+        for (k, v) in other.item_bodies {
+            let clean_k = normalize_entity_id(&k);
+            let clean_v = v.trim();
+            if !clean_k.is_empty() && !clean_v.is_empty() {
+                self.item_bodies.insert(clean_k, clean_v.to_owned());
+            }
+        }
+    }
+
+    fn from_json_value(val: &Value) -> Option<Self> {
+        if let Some(s) = val.as_str() {
+            let mut lines = s.trim().lines();
+            let subject = lines.next().unwrap_or("").trim().to_owned();
+            let body = lines.collect::<Vec<_>>().join("\n").trim().to_owned();
+            return Some(Self {
+                subject,
+                body,
+                item_subjects: IndexMap::new(),
+                item_bodies: IndexMap::new(),
+            });
+        }
+        let obj = val.as_object()?;
+        let pick_str = |keys: &[&str]| -> String {
+            for &k in keys {
+                if let Some(s) = obj.get(k).and_then(Value::as_str) {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        return trimmed.to_owned();
+                    }
+                }
+            }
+            String::new()
+        };
+
+        let subject = pick_str(&["subject", "title", "name", "summary", "header"]);
+        let body = pick_str(&["body", "description", "message", "details", "explanation"]);
+
+        let mut item_subjects = IndexMap::new();
+        let mut item_bodies = IndexMap::new();
+
+        let ingest_item_entry =
+            |raw_id: &str,
+             entry: &Value,
+             subjects: &mut IndexMap<String, String>,
+             bodies: &mut IndexMap<String, String>| {
+                let id = normalize_entity_id(raw_id);
+                if id.is_empty() {
+                    return;
+                }
+                if let Some(s) = entry.as_str() {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        subjects.insert(id, trimmed.to_owned());
+                    }
+                } else if let Some(item_obj) = entry.as_object() {
+                    for sk in ["subject", "title", "name", "summary"] {
+                        if let Some(s) = item_obj.get(sk).and_then(Value::as_str) {
+                            let trimmed = s.trim();
+                            if !trimmed.is_empty() {
+                                subjects.insert(id.clone(), trimmed.to_owned());
+                                break;
+                            }
+                        }
+                    }
+                    for bk in ["body", "description", "message", "details"] {
+                        if let Some(b) = item_obj.get(bk).and_then(Value::as_str) {
+                            let trimmed = b.trim();
+                            if !trimmed.is_empty() {
+                                bodies.insert(id.clone(), trimmed.to_owned());
+                                break;
+                            }
+                        }
+                    }
+                }
+            };
+
+        if let Some(sub_map) = obj.get("item_subjects").and_then(Value::as_object) {
+            for (k, v) in sub_map {
+                ingest_item_entry(k, v, &mut item_subjects, &mut item_bodies);
+            }
+        }
+
+        for body_key in ["item_bodies", "item_descriptions", "item_messages"] {
+            if let Some(b_map) = obj.get(body_key).and_then(Value::as_object) {
+                for (k, v) in b_map {
+                    let id = normalize_entity_id(k);
+                    if id.is_empty() {
+                        continue;
+                    }
+                    if let Some(s) = v.as_str() {
+                        let trimmed = s.trim();
+                        if !trimmed.is_empty() {
+                            item_bodies.insert(id, trimmed.to_owned());
+                        }
+                    } else {
+                        ingest_item_entry(&id, v, &mut item_subjects, &mut item_bodies);
+                    }
+                }
+            }
+        }
+
+        if let Some(items_val) = obj.get("items") {
+            if let Some(items_map) = items_val.as_object() {
+                for (k, v) in items_map {
+                    ingest_item_entry(k, v, &mut item_subjects, &mut item_bodies);
+                }
+            } else if let Some(items_arr) = items_val.as_array() {
+                for elem in items_arr {
+                    if let Some(elem_obj) = elem.as_object() {
+                        if let Some(raw_id) = elem_obj
+                            .get("id")
+                            .or_else(|| elem_obj.get("item_id"))
+                            .and_then(Value::as_str)
+                        {
+                            ingest_item_entry(raw_id, elem, &mut item_subjects, &mut item_bodies);
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(Self {
+            subject,
+            body,
+            item_subjects,
+            item_bodies,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for CommitMessageDraft {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let val = Value::deserialize(deserializer)?;
+        if val.is_null() {
+            return Ok(Self::default());
+        }
+        Self::from_json_value(&val)
+            .ok_or_else(|| serde::de::Error::custom("expected commit message object or string"))
+    }
 }
 
 /// LLM-authored commit messages keyed by `Operation.id` (e.g. `op1`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct CommitMessageProposal {
     #[serde(default)]
     pub messages: IndexMap<String, CommitMessageDraft>,
+}
+
+impl<'de> Deserialize<'de> for CommitMessageProposal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let val = Value::deserialize(deserializer)?;
+        if val.is_null() {
+            return Ok(Self::default());
+        }
+        let mut messages = IndexMap::new();
+
+        let ingest_collection = |coll: &Value, out: &mut IndexMap<String, CommitMessageDraft>| {
+            if let Some(map) = coll.as_object() {
+                for (k, v) in map {
+                    let op_id = normalize_entity_id(k);
+                    if !op_id.is_empty() {
+                        if let Some(draft) = CommitMessageDraft::from_json_value(v) {
+                            out.entry(op_id)
+                                .and_modify(|existing: &mut CommitMessageDraft| {
+                                    existing.merge_from(draft.clone())
+                                })
+                                .or_insert(draft);
+                        }
+                    }
+                }
+            } else if let Some(arr) = coll.as_array() {
+                for elem in arr {
+                    if let Some(obj) = elem.as_object() {
+                        if let Some(raw_id) = obj
+                            .get("id")
+                            .or_else(|| obj.get("op_id"))
+                            .or_else(|| obj.get("operation_id"))
+                            .or_else(|| obj.get("operation"))
+                            .and_then(Value::as_str)
+                        {
+                            let op_id = normalize_entity_id(raw_id);
+                            if !op_id.is_empty() {
+                                if let Some(draft) = CommitMessageDraft::from_json_value(elem) {
+                                    out.entry(op_id)
+                                        .and_modify(|existing: &mut CommitMessageDraft| {
+                                            existing.merge_from(draft.clone())
+                                        })
+                                        .or_insert(draft);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        if let Some(root) = val.as_object() {
+            let mut found_wrapper = false;
+            for wrapper_key in ["messages", "operations", "commits", "commit_messages"] {
+                if let Some(inner) = root.get(wrapper_key) {
+                    found_wrapper = true;
+                    ingest_collection(inner, &mut messages);
+                }
+            }
+            if !found_wrapper {
+                // Fallback: flat map `{"op1": {"subject": ..., "body": ...}}`
+                ingest_collection(&val, &mut messages);
+            }
+        } else if val.is_array() {
+            ingest_collection(&val, &mut messages);
+        } else {
+            return Err(serde::de::Error::custom(
+                "expected JSON object with `messages` map",
+            ));
+        }
+
+        Ok(Self { messages })
+    }
 }
 
 /// Applies a constrained `ClusterRefinementProposal` to initial clusters `c1..ck`,
@@ -228,12 +509,22 @@ pub fn apply_cluster_proposal(
         }
     }
 
+    let normalized_labels: IndexMap<String, &OperationLabel> = proposal
+        .labels
+        .iter()
+        .map(|(k, v)| (normalize_entity_id(k), v))
+        .collect();
+
     let mut ops = Vec::with_capacity(clusters.len());
     for (cid, item_ids) in clusters {
         if item_ids.is_empty() {
             continue;
         }
-        if let Some(label) = proposal.labels.get(&cid) {
+        if let Some(label) = proposal
+            .labels
+            .get(&cid)
+            .or_else(|| normalized_labels.get(&cid).copied())
+        {
             let resolved: Vec<&ChangeItem> = item_ids
                 .iter()
                 .filter_map(|id| items_by_id.get(id))

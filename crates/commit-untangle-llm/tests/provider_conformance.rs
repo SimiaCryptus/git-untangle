@@ -1,10 +1,18 @@
 use std::sync::{Arc, Mutex};
 
-use commit_untangle_core::proposal::{BuildDiagnosisProposal, ClusterRefinementProposal};
+use commit_untangle_core::bytes::RawBytes;
+use commit_untangle_core::model::{parse_and_classify, FileMode, Operation, RawFileDelta};
+use commit_untangle_core::proposal::{
+    BuildDiagnosisProposal, ClusterRefinementProposal, CommitMessageProposal,
+};
+use commit_untangle_llm::prompts::{
+    build_commit_message_batch_request, item_summary, plan_commit_message_batches,
+    DEFAULT_BATCH_CHAR_BUDGET, MAX_ITEMS_PER_COMMIT_MSG_BATCH,
+};
 use commit_untangle_llm::{
-    extract_json_value, generate_typed, ChatMessage, ChatModel, ChatRequest, ChatRole, ModelSpec,
-    ProviderKind, ProviderModel, RecordingModel, ReplayModel, SemanticModel, SemanticTask,
-    StructuredRequest,
+    extract_json_value, generate_typed, ChatMessage, ChatModel, ChatRequest, ChatRole, LlmError,
+    ModelSpec, ProviderKind, ProviderModel, RecordingModel, ReplayModel, SemanticModel,
+    SemanticTask, StructuredRequest,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -229,5 +237,185 @@ fn test_anthropic_gemini_openai_retry_and_ollama_cassette_wire_conformance() {
         let chat_replayer = ReplayModel::from_jsonl_file(&chat_cassette).unwrap();
         assert_eq!(chat_replayer.chat(chat_req).await.unwrap(), reply);
         let _ = std::fs::remove_file(&chat_cassette);
+    });
+}
+
+#[test]
+fn test_commit_message_lenient_deserialization_slice_planning_and_fatal_classification() {
+    // 1. Null `item_subjects`, bracketed IDs, and nested `items` objects must all deserialize cleanly
+    let raw_llm_json = json!({
+        "messages": {
+            "[op1]": {
+                "subject": "feat(llm): add multi-provider structured prompt adapters",
+                "body": "Introduces provider HTTP adapters and prompt builders.",
+                "items": {
+                    "[i1]": {
+                        "subject": "feat(llm): add Anthropic and Gemini HTTP client",
+                        "body": "Implements JSON extraction and retry loop for Anthropic and Gemini."
+                    },
+                    "i2": {
+                        "subject": "feat(llm): add structured prompt builders",
+                        "body": "Adds batching and item summaries for semantic operations."
+                    }
+                }
+            },
+            "op3": {
+                "subject": "chore: add commit-untangle-core manifest",
+                "body": "Declares workspace dependencies for the core crate.",
+                "item_subjects": null,
+                "item_bodies": null
+            }
+        }
+    });
+    let parsed_prop: CommitMessageProposal = serde_json::from_value(raw_llm_json).unwrap();
+    assert_eq!(parsed_prop.messages.len(), 2);
+    let op1 = &parsed_prop.messages["op1"];
+    assert_eq!(
+        op1.item_subjects["i1"],
+        "feat(llm): add Anthropic and Gemini HTTP client"
+    );
+    assert!(op1.item_bodies["i1"].contains("Anthropic and Gemini"));
+    assert!(parsed_prop.messages["op3"].item_subjects.is_empty());
+
+    // 2. `AddFile` item_summary includes actual file lines + oversized operation slices cover every item
+    let total_files = MAX_ITEMS_PER_COMMIT_MSG_BATCH * 2 + 3;
+    let deltas: Vec<RawFileDelta> = (0..total_files)
+        .map(|idx| RawFileDelta {
+            status: 'A',
+            old_path: None,
+            new_path: Some(format!("crates/mod_{idx}/Cargo.toml")),
+            old_mode: None,
+            new_mode: Some(FileMode::Regular),
+            old_content: None,
+            new_content: Some(RawBytes::from(format!(
+                "[package]\nname = \"mod-{idx}\"\nversion = \"0.1.0\"\n"
+            ))),
+            zero_context_diff: None,
+        })
+        .collect();
+    let parsed = parse_and_classify(deltas, 3);
+    let first_item = parsed.items.values().next().unwrap();
+    let summary = item_summary(first_item, 4);
+    assert!(
+        summary.contains("name = \"mod-0\""),
+        "AddFile summary must preview file contents: {summary}"
+    );
+
+    let big_op = Operation::new(
+        "op1",
+        "Add workspace manifests",
+        "Adds manifests",
+        "config",
+        parsed.items.keys().cloned().collect(),
+    );
+    let batches = plan_commit_message_batches(&[big_op], &parsed.items, DEFAULT_BATCH_CHAR_BUDGET);
+    assert_eq!(
+        batches.len(),
+        3,
+        "27 items should split into 3 slices of <=12"
+    );
+    let last_req = build_commit_message_batch_request(&batches[2], "ctx", &parsed.items);
+    assert!(
+        last_req.user_prompt.contains(&format!("[i{total_files}]")),
+        "final slice must include the last item"
+    );
+
+    // 3. HTTP 404 model-not-found is classified as fatal with a model hint
+    let err_404 = LlmError::ProviderResponse {
+        status: 404,
+        body: "{\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":\"model: claude-nonexistent\"}}".to_owned(),
+    };
+    assert!(err_404.is_fatal_config_or_auth());
+    assert!(err_404.diagnostic_hint().unwrap().contains("--model"));
+}
+
+#[test]
+fn test_anthropic_deprecated_temperature_auto_omits_and_retries() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let cap_clone = Arc::clone(&captured);
+
+        tokio::spawn(async move {
+            let responses = vec![
+                (
+                    "400 Bad Request",
+                    json!({
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": "`temperature` is deprecated for this model."
+                        }
+                    })
+                    .to_string(),
+                ),
+                (
+                    "200 OK",
+                    json!({
+                        "content": [{ "type": "text", "text": "{\"messages\":{\"op1\":{\"subject\":\"feat: add adapter\",\"body\":\"Adds adapter.\"}}}" }],
+                        "stop_reason": "end_turn"
+                    })
+                    .to_string(),
+                ),
+                (
+                    "200 OK",
+                    json!({
+                        "content": [{ "type": "text", "text": "{\"messages\":{\"op2\":{\"subject\":\"chore: update lockfile\",\"body\":\"Updates lockfile.\"}}}" }],
+                        "stop_reason": "end_turn"
+                    })
+                    .to_string(),
+                ),
+            ];
+            for (status, body) in responses {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 32768];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                cap_clone
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let model = ProviderModel::new(
+            ModelSpec::parse("anthropic::claude-haiku-5-5").unwrap(),
+            Some("test-anth-key".to_owned()),
+            format!("http://{addr}"),
+        )
+        .unwrap();
+
+        let p1: CommitMessageProposal =
+            generate_typed(&model, sample_request(SemanticTask::WriteCommitMessages))
+                .await
+                .unwrap();
+        assert_eq!(p1.messages["op1"].subject, "feat: add adapter");
+
+        // Second call on the same ProviderModel should omit `temperature` on the first try
+        let p2: CommitMessageProposal =
+            generate_typed(&model, sample_request(SemanticTask::WriteCommitMessages))
+                .await
+                .unwrap();
+        assert_eq!(p2.messages["op2"].subject, "chore: update lockfile");
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 3);
+        assert!(reqs[0].contains("\"temperature\""));
+        assert!(!reqs[1].contains("\"temperature\""));
+        assert!(!reqs[2].contains("\"temperature\""));
     });
 }
