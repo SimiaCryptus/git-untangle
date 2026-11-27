@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/commit-untangle-core",
+    "crates/commit-untangle-git",
+    "crates/commit-untangle-llm",
+    "crates/commit-untangle-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.80"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+clap = { version = "4.6", features = ["derive"] }
+hex = "0.4"
+indexmap = { version = "2.14", features = ["serde"] }
+libc = "0.2"
+memchr = "2.8"
+rand = "0.8"
+rand_chacha = "0.3"
+regex = "1.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha1 = "0.10"
+sha2 = "0.10"
+thiserror = "1.0"
+tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync"] }
+toml_edit = "0.19"
+tracing = "0.1"
+xdg-home = "1.3"
+
+commit-untangle-core = { path = "crates/commit-untangle-core" }
+commit-untangle-git = { path = "crates/commit-untangle-git" }
+commit-untangle-llm = { path = "crates/commit-untangle-llm" }
+commit-untangle-cli = { path = "crates/commit-untangle-cli" }
